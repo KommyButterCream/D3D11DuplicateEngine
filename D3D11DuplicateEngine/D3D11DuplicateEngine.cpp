@@ -2,9 +2,9 @@
 #include "D3D11DuplicateEngine.h"
 #include "D3D11DuplicateThread.h"
 
-#include "../Modules/D3D11Engine/Core/D3D11RenderEngine.h"
-#include "../Modules/D3D11ImageIO/D3D11ImageIO/D3D11ImageIO.h"
-#include "../Modules/Core/DirectX/DxSafeRelease.h"  // for SafeRelease
+#include "../../../Module/D3D11Engine/Core/D3D11RenderEngine.h"
+#include "../../../Module/D3D11ImageIO/D3D11ImageIO/D3D11ImageIO.h"
+#include "../../../Module/Core/DirectX/DxSafeRelease.h"  // for SafeRelease
 
 using namespace Core::DirectX;
 

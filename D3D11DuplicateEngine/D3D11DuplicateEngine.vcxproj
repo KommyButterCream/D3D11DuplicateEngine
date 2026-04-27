@@ -33,10 +33,10 @@
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\Modules\D3D11Engine\D3D11Engine\D3D11Engine.vcxproj">
+    <ProjectReference Include="..\..\D3D11Engine\D3D11Engine\D3D11Engine.vcxproj">
       <Project>{ec25124d-4c9f-40f6-8b16-ecd4db749cc8}</Project>
     </ProjectReference>
-    <ProjectReference Include="..\Modules\D3D11ImageIO\D3D11ImageIO\D3D11ImageIO.vcxproj">
+    <ProjectReference Include="..\..\D3D11ImageIO\D3D11ImageIO\D3D11ImageIO.vcxproj">
       <Project>{cab1b3ea-0100-4095-b339-ca0d2b237467}</Project>
     </ProjectReference>
   </ItemGroup>

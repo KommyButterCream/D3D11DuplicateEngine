@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../Modules/Core/Concurrency/ThreadBase.h"
+#include "../../../Module/Core/Concurrency/ThreadBase.h"
 
 class D3D11DuplicateEngine;
 
