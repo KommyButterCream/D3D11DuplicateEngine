@@ -29,6 +29,13 @@ struct CaptureFrameResult
 	PTR_INFO mouseInfo = {};   // 마우스 위치 및 모양
 };
 
+enum FrameStatus : LONG
+{
+	EMPTY = 0,
+	READY,
+	BUSY,
+};
+
 struct CapturedFrameSlot
 {
 	ID3D11Texture2D* texture = nullptr;
@@ -36,8 +43,14 @@ struct CapturedFrameSlot
 	PTR_INFO mouseInfo = {};
 
 	volatile LONG referenceCount = 0;
-	volatile LONG ready = 0;
+	volatile LONG status = FrameStatus::EMPTY;
 	uint64_t frameId = 0ULL;
+};
+
+struct CapturedFrameHandle
+{
+	ID3D11Texture2D* texture = nullptr;
+	LONG slotId = 0;
 };
 
 struct SharedCaptureData

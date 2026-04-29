@@ -75,6 +75,12 @@ bool D3D11DuplicateEngine::Initialize(uint32_t outputIndex)
 		}
 	}
 
+	if (!InitializeCaptureFramePool())
+	{
+		Shutdown();
+		return false;
+	}
+
 	m_outputIndex = outputIndex;
 	m_initialized = true;
 
@@ -84,6 +90,8 @@ bool D3D11DuplicateEngine::Initialize(uint32_t outputIndex)
 void D3D11DuplicateEngine::Shutdown()
 {
 	StopThread();
+
+	DestroyCaptureFramePool();
 
 	if (m_WICImageIO)
 	{
@@ -234,7 +242,7 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT timeout_ms, CaptureFrameResult& out
 			return false;
 		}
 	}
-	
+
 	if (m_useMoveDiryInfo)
 	{
 		if (!UpdateDirtyMoveInfo(frameInfo, outResult))
@@ -333,6 +341,37 @@ void D3D11DuplicateEngine::SetFrameCaptureCallback(FrameCallback funcCallback, v
 	m_userData = userData;
 }
 
+CapturedFrameHandle D3D11DuplicateEngine::GetLatestFrameHandle()
+{
+	CapturedFrameHandle handle = {};
+
+	const LONG slotId = GetLatestFrameID();
+
+	handle.slotId = slotId;
+	m_framePool[slotId].texture->AddRef();
+	handle.texture = m_framePool[slotId].texture;
+
+	::InterlockedIncrement(&m_framePool[slotId].referenceCount);
+
+	return handle;
+}
+
+void D3D11DuplicateEngine::ReleaseLatestFrameHandle(CapturedFrameHandle& handle)
+{
+	if (!handle.texture)
+		return;
+
+	const LONG slotId = handle.slotId;
+	if (slotId < 0 || slotId >= POOL_COUNT)
+		return;
+
+	CapturedFrameSlot& frameSlot = m_framePool[slotId];
+
+	frameSlot.texture->Release();
+	::InterlockedDecrement(&m_framePool[slotId].referenceCount);
+	::InterlockedExchange(&m_framePool[slotId].status, FrameStatus::EMPTY);
+}
+
 ID3D11Device1* D3D11DuplicateEngine::GetD3DDevice()
 {
 	if (!m_D3D11Engine)
@@ -384,6 +423,8 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 	if (!captureFrame.texture)
 		return;
 
+	CopyCaptureTextureToPool(captureFrame.texture);
+
 	CaptureCallbackContext* context = static_cast<CaptureCallbackContext*>(m_userData);
 
 	if (m_enableSharedTexture && m_sharedHandle && context && context->sharedData)
@@ -406,7 +447,7 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 }
 
 // 로컬 뷰어(ImageViewer.dll)와 Zero-Copy를 위한 텍스처 생성
-HRESULT D3D11DuplicateEngine::CreateSharedTexture(UINT width, UINT height, ID3D11Texture2D** ppTexture, HANDLE* pSharedHandle)
+HRESULT D3D11DuplicateEngine::CreateSharedTexture(UINT width, UINT height, ID3D11Texture2D** texture, HANDLE* sharedHandle)
 {
 	D3D11_TEXTURE2D_DESC desc = {};
 	desc.Width = width;
@@ -419,17 +460,86 @@ HRESULT D3D11DuplicateEngine::CreateSharedTexture(UINT width, UINT height, ID3D1
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED; // 핵심: 공유 플래그
 
-	HRESULT hr = m_D3D11Engine->GetD3DDevice()->CreateTexture2D(&desc, nullptr, ppTexture);
+	HRESULT hr = m_D3D11Engine->GetD3DDevice()->CreateTexture2D(&desc, nullptr, texture);
 	if (FAILED(hr)) return hr;
 
 	IDXGIResource* pDXGIResource = nullptr;
-	hr = (*ppTexture)->QueryInterface(__uuidof(IDXGIResource), (void**)&pDXGIResource);
+	hr = (*texture)->QueryInterface(__uuidof(IDXGIResource), (void**)&pDXGIResource);
 	if (SUCCEEDED(hr))
 	{
-		hr = pDXGIResource->GetSharedHandle(pSharedHandle);
+		hr = pDXGIResource->GetSharedHandle(sharedHandle);
 		pDXGIResource->Release();
 	}
 	return hr;
+}
+
+bool D3D11DuplicateEngine::InitializeCaptureFramePool()
+{
+	for (size_t i = 0; i < POOL_COUNT; i++)
+	{
+		CapturedFrameSlot& frameSlot = m_framePool[i];
+
+		frameSlot.frameId = 0;
+		frameSlot.frameInfo = {};
+		frameSlot.mouseInfo = {};
+		frameSlot.status = FrameStatus::EMPTY;
+		frameSlot.referenceCount = 0;
+		SafeRelease(frameSlot.texture);
+
+		D3D11_TEXTURE2D_DESC desc = {};
+		desc.Width = m_duplDesc.ModeDesc.Width;
+		desc.Height = m_duplDesc.ModeDesc.Height;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		desc.MiscFlags = 0;
+
+		HRESULT hr = m_D3D11Engine->GetD3DDevice()->CreateTexture2D(&desc, nullptr, &frameSlot.texture);
+		if (FAILED(hr))
+			return false;
+	}
+
+	return true;
+}
+
+void D3D11DuplicateEngine::DestroyCaptureFramePool()
+{
+	for (size_t i = 0; i < POOL_COUNT; i++)
+	{
+		CapturedFrameSlot& frameSlot = m_framePool[i];
+
+		SafeRelease(frameSlot.texture);
+	}
+}
+
+void D3D11DuplicateEngine::CopyCaptureTextureToPool(ID3D11Texture2D* capturedTexture)
+{
+	const LONG latestFrameID = GetLatestFrameID();
+	const LONG nextFrameID = (latestFrameID + 1) & (POOL_COUNT - 1);
+
+	CapturedFrameSlot& frameSlot = m_framePool[nextFrameID];
+
+	const LONG frameStatus = ::InterlockedCompareExchange(&frameSlot.status, 0, 0);
+
+	if (frameStatus == FrameStatus::EMPTY)
+	{
+		m_D3D11Engine->GetD3DDeviceContext()->CopyResource(frameSlot.texture, capturedTexture);
+
+		::InterlockedExchange(&frameSlot.status, FrameStatus::READY);
+		::InterlockedExchange(&m_latestFrameId, nextFrameID);
+	}
+	else
+	{
+		// Drop
+	}
+}
+
+LONG D3D11DuplicateEngine::GetLatestFrameID()
+{
+	return ::InterlockedCompareExchange(&m_latestFrameId, 0, 0);
 }
 
 bool D3D11DuplicateEngine::UpdateMouseInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo)

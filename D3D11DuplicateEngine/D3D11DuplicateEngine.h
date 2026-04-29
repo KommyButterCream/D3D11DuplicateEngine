@@ -43,13 +43,21 @@ public:
 
 	void SetFrameCaptureCallback(FrameCallback funcCallback, void* userData); // 스레드에서 호출 할 함수 등록
 
+	CapturedFrameHandle GetLatestFrameHandle();
+	void ReleaseLatestFrameHandle(CapturedFrameHandle& handle);
+
 	ID3D11Device1* GetD3DDevice();
 
 private:
 	friend class D3D11DuplicateThread;
 
 	HRESULT InitializeDuplication(uint32_t outputIndex);
-	HRESULT CreateSharedTexture(UINT width, UINT height, ID3D11Texture2D** ppTexture, HANDLE* pSharedHandle);
+	HRESULT CreateSharedTexture(UINT width, UINT height, ID3D11Texture2D** texture, HANDLE* sharedHandle);
+
+	bool InitializeCaptureFramePool();
+	void DestroyCaptureFramePool();
+	void CopyCaptureTextureToPool(ID3D11Texture2D* capturedTexture);
+	LONG GetLatestFrameID();
 
 	bool UpdateMouseInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo);
 	bool UpdateDirtyMoveInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo, CaptureFrameResult& outResult);
@@ -74,6 +82,13 @@ private:
 
 	// Capture Frame per second
 	uint64_t m_captureFPS = 0;
+
+	// Capture Result
+	static constexpr size_t POOL_COUNT = 4;
+	CapturedFrameSlot m_framePool[POOL_COUNT];
+	static_assert((POOL_COUNT& (POOL_COUNT - 1)) == 0, "Pool count must be power of two");
+	alignas(64) LONG m_latestFrameId = 0;
+
 
 	// Capture Image
 	bool m_enableSharedTexture = true;
