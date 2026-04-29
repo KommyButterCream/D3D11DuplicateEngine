@@ -93,7 +93,7 @@ void D3D11DuplicateEngine::Shutdown()
 
 	SafeRelease(m_dxgiOutput);
 	SafeRelease(m_deskDupl);
-	SafeRelease(m_acquiredImage);
+	SafeRelease(m_capturedTexture);
 	SafeRelease(m_sharedTexture);
 
 	m_frameAcquired = false;
@@ -126,6 +126,16 @@ void D3D11DuplicateEngine::Shutdown()
 	}
 
 	m_initialized = false;
+}
+
+void D3D11DuplicateEngine::SetTargetFps(uint64_t fps)
+{
+	m_captureFPS = fps;
+}
+
+uint64_t D3D11DuplicateEngine::GetTargetFps() const
+{
+	return m_captureFPS;
 }
 
 uint32_t D3D11DuplicateEngine::GetOutputCount() const
@@ -173,12 +183,12 @@ uint32_t D3D11DuplicateEngine::GetOutputHeight()
 	return m_duplDesc.ModeDesc.Height;
 }
 
-bool D3D11DuplicateEngine::AcquireFrame(UINT TimeoutInMilliseconds, CaptureFrameResult& outResult)
+bool D3D11DuplicateEngine::AcquireFrame(UINT timeout_ms, CaptureFrameResult& outResult)
 {
 	if (!IsInitialized())
 		return false;
 
-	outResult.frame = nullptr;
+	outResult.texture = nullptr;
 	outResult.sharedHandle = nullptr;
 	outResult.frameInfo = {};
 	outResult.metaData = nullptr;
@@ -190,7 +200,7 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT TimeoutInMilliseconds, CaptureFrame
 	DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
 
 	// 프레임 획득
-	HRESULT hr = m_deskDupl->AcquireNextFrame(TimeoutInMilliseconds, &frameInfo, &desktopResource);
+	HRESULT hr = m_deskDupl->AcquireNextFrame(timeout_ms, &frameInfo, &desktopResource);
 	if (hr == DXGI_ERROR_WAIT_TIMEOUT)
 		return true;
 
@@ -206,32 +216,38 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT TimeoutInMilliseconds, CaptureFrame
 	m_frameAcquired = true;
 
 	// 텍스처 변환
-	SafeRelease(m_acquiredImage);
-	hr = desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&m_acquiredImage));
+	SafeRelease(m_capturedTexture);
+	hr = desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&m_capturedTexture));
 	SafeRelease(desktopResource);
-	if (FAILED(hr) || !m_acquiredImage)
+	if (FAILED(hr) || !m_capturedTexture)
 	{
 		ReleaseFrame();
 		return false;
 	}
 
 	// 데이터 업데이트
-	if (!UpdateMouseInfo(frameInfo))
+	if (m_useMouseInfo)
 	{
-		ReleaseFrame();
-		return false;
+		if (!UpdateMouseInfo(frameInfo))
+		{
+			ReleaseFrame();
+			return false;
+		}
 	}
-
-	if (!UpdateDirtyMoveInfo(frameInfo, outResult))
+	
+	if (m_useMoveDiryInfo)
 	{
-		ReleaseFrame();
-		return false;
+		if (!UpdateDirtyMoveInfo(frameInfo, outResult))
+		{
+			ReleaseFrame();
+			return false;
+		}
 	}
 
 	// 로컬 뷰어용 공유 텍스쳐 복사
 	if (m_sharedTexture)
 	{
-		m_D3D11Engine->GetD3DDeviceContext()->CopyResource(m_sharedTexture, m_acquiredImage);
+		m_D3D11Engine->GetD3DDeviceContext()->CopyResource(m_sharedTexture, m_capturedTexture);
 	}
 
 	//if (m_WICImageIO)
@@ -239,7 +255,7 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT TimeoutInMilliseconds, CaptureFrame
 	//	if (FAILED(m_WICImageIO->SaveTextureToFile(
 	//		m_D3D11Engine->GetD3DDevice(),
 	//		m_D3D11Engine->GetD3DDeviceContext(),
-	//		m_acquiredImage,
+	//		m_capturedTexture,
 	//		L"C:\\debug\\desktop.bmp"
 	//	)))
 	//	{
@@ -248,10 +264,13 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT TimeoutInMilliseconds, CaptureFrame
 	//}
 
 	// 결과 저장
-	outResult.frame = m_acquiredImage;
+	outResult.texture = m_capturedTexture;
 	outResult.sharedHandle = m_enableSharedTexture == true ? m_sharedHandle : nullptr;
 	outResult.frameInfo = frameInfo;
-	outResult.mouseInfo = m_mouseInfo;
+	if (m_useMouseInfo)
+	{
+		outResult.mouseInfo = m_mouseInfo;
+	}
 
 	return true;
 }
@@ -267,7 +286,7 @@ void D3D11DuplicateEngine::ReleaseFrame()
 			return;
 	}
 
-	SafeRelease(m_acquiredImage);
+	SafeRelease(m_capturedTexture);
 }
 
 HRESULT D3D11DuplicateEngine::InitializeDuplication(uint32_t outputIndex)
@@ -362,7 +381,7 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 		return;
 	}
 
-	if (!captureFrame.frame)
+	if (!captureFrame.texture)
 		return;
 
 	CaptureCallbackContext* context = static_cast<CaptureCallbackContext*>(m_userData);
@@ -415,6 +434,9 @@ HRESULT D3D11DuplicateEngine::CreateSharedTexture(UINT width, UINT height, ID3D1
 
 bool D3D11DuplicateEngine::UpdateMouseInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo)
 {
+	if (!m_useMouseInfo)
+		return true;
+
 	if (frameInfo.LastMouseUpdateTime.QuadPart == 0)
 		return true;
 
@@ -485,6 +507,9 @@ bool D3D11DuplicateEngine::UpdateMouseInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo)
 
 bool D3D11DuplicateEngine::UpdateDirtyMoveInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo, CaptureFrameResult& outResult)
 {
+	if (!m_useMoveDiryInfo)
+		return true;
+
 	HRESULT hr = S_OK;
 
 	outResult.metaData = nullptr;
