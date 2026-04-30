@@ -345,13 +345,51 @@ CapturedFrameHandle D3D11DuplicateEngine::GetLatestFrameHandle()
 {
 	CapturedFrameHandle handle = {};
 
-	const LONG slotId = GetLatestFrameID();
+	if (!IsInitialized())
+		return handle;
 
-	handle.slotId = slotId;
-	m_framePool[slotId].texture->AddRef();
-	handle.texture = m_framePool[slotId].texture;
+	for (size_t attempt = 0; attempt < POOL_COUNT; ++attempt)
+	{
+		const LONG64 latestFrameId = GetLatestFrameID();
+		const LONG slotId = GetLatestFrameSlotID();
 
-	::InterlockedIncrement(&m_framePool[slotId].referenceCount);
+		if (latestFrameId <= 0 || slotId < 0 || slotId >= static_cast<LONG>(POOL_COUNT))
+			return handle;
+
+		CapturedFrameSlot& frameSlot = m_framePool[slotId];
+		const LONG status = ::InterlockedCompareExchange(&frameSlot.status, 0, 0);
+		const LONG64 slotFrameId = ::InterlockedCompareExchange64(&frameSlot.frameId, 0, 0);
+
+		if (status != FrameStatus::READY || slotFrameId != latestFrameId || !frameSlot.texture)
+			continue;
+
+		::InterlockedIncrement(&frameSlot.referenceCount);
+
+		const LONG statusAfter = ::InterlockedCompareExchange(&frameSlot.status, 0, 0);
+		const LONG64 slotFrameIdAfter = ::InterlockedCompareExchange64(&frameSlot.frameId, 0, 0);
+		const LONG64 latestFrameIdAfter = GetLatestFrameID();
+		const LONG latestSlotIdAfter = GetLatestFrameSlotID();
+
+		if (statusAfter == FrameStatus::READY &&
+			slotFrameIdAfter == latestFrameId &&
+			latestFrameIdAfter == latestFrameId &&
+			latestSlotIdAfter == slotId)
+		{
+			if (!WaitForFrameSlotCopy(frameSlot))
+			{
+				::InterlockedDecrement(&frameSlot.referenceCount);
+				return handle;
+			}
+
+			frameSlot.texture->AddRef();
+			handle.texture = frameSlot.texture;
+			handle.slotId = slotId;
+			handle.frameId = static_cast<uint64_t>(latestFrameId);
+			return handle;
+		}
+
+		::InterlockedDecrement(&frameSlot.referenceCount);
+	}
 
 	return handle;
 }
@@ -363,13 +401,32 @@ void D3D11DuplicateEngine::ReleaseLatestFrameHandle(CapturedFrameHandle& handle)
 
 	const LONG slotId = handle.slotId;
 	if (slotId < 0 || slotId >= POOL_COUNT)
+	{
+		handle.texture->Release();
+		handle.texture = nullptr;
+		handle.slotId = -1;
+		handle.frameId = 0ULL;
 		return;
+	}
 
 	CapturedFrameSlot& frameSlot = m_framePool[slotId];
 
-	frameSlot.texture->Release();
-	::InterlockedDecrement(&m_framePool[slotId].referenceCount);
-	::InterlockedExchange(&m_framePool[slotId].status, FrameStatus::EMPTY);
+	handle.texture->Release();
+
+	const LONG referenceCount = ::InterlockedDecrement(&frameSlot.referenceCount);
+	if (referenceCount < 0)
+	{
+		::InterlockedExchange(&frameSlot.referenceCount, 0);
+	}
+
+	handle.texture = nullptr;
+	handle.slotId = -1;
+	handle.frameId = 0ULL;
+}
+
+uint64_t D3D11DuplicateEngine::GetDroppedFrameCount()
+{
+	return static_cast<uint64_t>(::InterlockedCompareExchange64(&m_droppedFrameCount, 0, 0));
 }
 
 ID3D11Device1* D3D11DuplicateEngine::GetD3DDevice()
@@ -423,7 +480,7 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 	if (!captureFrame.texture)
 		return;
 
-	CopyCaptureTextureToPool(captureFrame.texture);
+	CopyCaptureTextureToPool(captureFrame.texture, captureFrame.frameInfo, captureFrame.mouseInfo);
 
 	CaptureCallbackContext* context = static_cast<CaptureCallbackContext*>(m_userData);
 
@@ -475,16 +532,21 @@ HRESULT D3D11DuplicateEngine::CreateSharedTexture(UINT width, UINT height, ID3D1
 
 bool D3D11DuplicateEngine::InitializeCaptureFramePool()
 {
+	::InterlockedExchange64(&m_latestFrameId, 0);
+	::InterlockedExchange(&m_latestFrameSlotId, -1);
+	::InterlockedExchange64(&m_droppedFrameCount, 0);
+
 	for (size_t i = 0; i < POOL_COUNT; i++)
 	{
 		CapturedFrameSlot& frameSlot = m_framePool[i];
 
-		frameSlot.frameId = 0;
+		::InterlockedExchange64(&frameSlot.frameId, 0);
 		frameSlot.frameInfo = {};
 		frameSlot.mouseInfo = {};
-		frameSlot.status = FrameStatus::EMPTY;
-		frameSlot.referenceCount = 0;
+		::InterlockedExchange(&frameSlot.status, FrameStatus::EMPTY);
+		::InterlockedExchange(&frameSlot.referenceCount, 0);
 		SafeRelease(frameSlot.texture);
+		SafeRelease(frameSlot.copyDoneQuery);
 
 		D3D11_TEXTURE2D_DESC desc = {};
 		desc.Width = m_duplDesc.ModeDesc.Width;
@@ -500,6 +562,12 @@ bool D3D11DuplicateEngine::InitializeCaptureFramePool()
 		HRESULT hr = m_D3D11Engine->GetD3DDevice()->CreateTexture2D(&desc, nullptr, &frameSlot.texture);
 		if (FAILED(hr))
 			return false;
+
+		D3D11_QUERY_DESC queryDesc = {};
+		queryDesc.Query = D3D11_QUERY_EVENT;
+		hr = m_D3D11Engine->GetD3DDevice()->CreateQuery(&queryDesc, &frameSlot.copyDoneQuery);
+		if (FAILED(hr))
+			return false;
 	}
 
 	return true;
@@ -507,39 +575,104 @@ bool D3D11DuplicateEngine::InitializeCaptureFramePool()
 
 void D3D11DuplicateEngine::DestroyCaptureFramePool()
 {
+	::InterlockedExchange64(&m_latestFrameId, 0);
+	::InterlockedExchange(&m_latestFrameSlotId, -1);
+	::InterlockedExchange64(&m_droppedFrameCount, 0);
+
 	for (size_t i = 0; i < POOL_COUNT; i++)
 	{
 		CapturedFrameSlot& frameSlot = m_framePool[i];
 
+		::InterlockedExchange(&frameSlot.status, FrameStatus::EMPTY);
+		::InterlockedExchange(&frameSlot.referenceCount, 0);
+		::InterlockedExchange64(&frameSlot.frameId, 0);
 		SafeRelease(frameSlot.texture);
+		SafeRelease(frameSlot.copyDoneQuery);
 	}
 }
 
-void D3D11DuplicateEngine::CopyCaptureTextureToPool(ID3D11Texture2D* capturedTexture)
+void D3D11DuplicateEngine::CopyCaptureTextureToPool(ID3D11Texture2D* capturedTexture, const DXGI_OUTDUPL_FRAME_INFO& frameInfo, const PTR_INFO& mouseInfo)
 {
-	const LONG latestFrameID = GetLatestFrameID();
-	const LONG nextFrameID = (latestFrameID + 1) & (POOL_COUNT - 1);
+	if (!capturedTexture)
+		return;
 
-	CapturedFrameSlot& frameSlot = m_framePool[nextFrameID];
+	const LONG64 nextFrameId = GetLatestFrameID() + 1;
+	const LONG latestSlotId = GetLatestFrameSlotID();
+	const LONG startSlotId = latestSlotId >= 0 ? ((latestSlotId + 1) & (POOL_COUNT - 1)) : 0;
 
-	const LONG frameStatus = ::InterlockedCompareExchange(&frameSlot.status, 0, 0);
-
-	if (frameStatus == FrameStatus::EMPTY)
+	for (size_t offset = 0; offset < POOL_COUNT; ++offset)
 	{
+		const LONG slotId = (startSlotId + static_cast<LONG>(offset)) & (POOL_COUNT - 1);
+		CapturedFrameSlot& frameSlot = m_framePool[slotId];
+
+		if (!frameSlot.texture)
+			continue;
+
+		const LONG referenceCount = ::InterlockedCompareExchange(&frameSlot.referenceCount, 0, 0);
+		if (referenceCount != 0)
+			continue;
+
+		const LONG previousStatus = ::InterlockedCompareExchange(&frameSlot.status, 0, 0);
+		if (previousStatus == FrameStatus::BUSY)
+			continue;
+
+		if (::InterlockedCompareExchange(&frameSlot.status, FrameStatus::BUSY, previousStatus) != previousStatus)
+			continue;
+
+		if (::InterlockedCompareExchange(&frameSlot.referenceCount, 0, 0) != 0)
+		{
+			::InterlockedExchange(&frameSlot.status, previousStatus);
+			continue;
+		}
+
 		m_D3D11Engine->GetD3DDeviceContext()->CopyResource(frameSlot.texture, capturedTexture);
+		if (frameSlot.copyDoneQuery)
+		{
+			m_D3D11Engine->GetD3DDeviceContext()->End(frameSlot.copyDoneQuery);
+		}
 
+		frameSlot.frameInfo = frameInfo;
+		frameSlot.mouseInfo = mouseInfo;
+		::InterlockedExchange64(&frameSlot.frameId, nextFrameId);
 		::InterlockedExchange(&frameSlot.status, FrameStatus::READY);
-		::InterlockedExchange(&m_latestFrameId, nextFrameID);
+		::InterlockedExchange(&m_latestFrameSlotId, slotId);
+		::InterlockedExchange64(&m_latestFrameId, nextFrameId);
+		return;
 	}
-	else
-	{
-		// Drop
-	}
+
+	::InterlockedIncrement64(&m_droppedFrameCount);
 }
 
-LONG D3D11DuplicateEngine::GetLatestFrameID()
+LONG64 D3D11DuplicateEngine::GetLatestFrameID()
 {
-	return ::InterlockedCompareExchange(&m_latestFrameId, 0, 0);
+	return ::InterlockedCompareExchange64(&m_latestFrameId, 0, 0);
+}
+
+LONG D3D11DuplicateEngine::GetLatestFrameSlotID()
+{
+	return ::InterlockedCompareExchange(&m_latestFrameSlotId, 0, 0);
+}
+
+bool D3D11DuplicateEngine::WaitForFrameSlotCopy(CapturedFrameSlot& frameSlot)
+{
+	if (!frameSlot.copyDoneQuery)
+		return true;
+
+	ID3D11DeviceContext* context = m_D3D11Engine ? m_D3D11Engine->GetD3DDeviceContext() : nullptr;
+	if (!context)
+		return false;
+
+	for (;;)
+	{
+		const HRESULT hr = context->GetData(frameSlot.copyDoneQuery, nullptr, 0, 0);
+		if (hr == S_OK)
+			return true;
+
+		if (hr != S_FALSE)
+			return false;
+
+		::Sleep(0);
+	}
 }
 
 bool D3D11DuplicateEngine::UpdateMouseInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo)

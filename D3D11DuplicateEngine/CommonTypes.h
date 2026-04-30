@@ -39,18 +39,20 @@ enum FrameStatus : LONG
 struct CapturedFrameSlot
 {
 	ID3D11Texture2D* texture = nullptr;
+	ID3D11Query* copyDoneQuery = nullptr;
 	DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
 	PTR_INFO mouseInfo = {};
 
 	volatile LONG referenceCount = 0;
 	volatile LONG status = FrameStatus::EMPTY;
-	uint64_t frameId = 0ULL;
+	volatile LONG64 frameId = 0;
 };
 
 struct CapturedFrameHandle
 {
 	ID3D11Texture2D* texture = nullptr;
-	LONG slotId = 0;
+	LONG slotId = -1;
+	uint64_t frameId = 0ULL;
 };
 
 struct SharedCaptureData

@@ -45,6 +45,7 @@ public:
 
 	CapturedFrameHandle GetLatestFrameHandle();
 	void ReleaseLatestFrameHandle(CapturedFrameHandle& handle);
+	uint64_t GetDroppedFrameCount();
 
 	ID3D11Device1* GetD3DDevice();
 
@@ -56,8 +57,10 @@ private:
 
 	bool InitializeCaptureFramePool();
 	void DestroyCaptureFramePool();
-	void CopyCaptureTextureToPool(ID3D11Texture2D* capturedTexture);
-	LONG GetLatestFrameID();
+	void CopyCaptureTextureToPool(ID3D11Texture2D* capturedTexture, const DXGI_OUTDUPL_FRAME_INFO& frameInfo, const PTR_INFO& mouseInfo);
+	LONG64 GetLatestFrameID();
+	LONG GetLatestFrameSlotID();
+	bool WaitForFrameSlotCopy(CapturedFrameSlot& frameSlot);
 
 	bool UpdateMouseInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo);
 	bool UpdateDirtyMoveInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo, CaptureFrameResult& outResult);
@@ -87,7 +90,9 @@ private:
 	static constexpr size_t POOL_COUNT = 4;
 	CapturedFrameSlot m_framePool[POOL_COUNT];
 	static_assert((POOL_COUNT& (POOL_COUNT - 1)) == 0, "Pool count must be power of two");
-	alignas(64) LONG m_latestFrameId = 0;
+	alignas(64) volatile LONG64 m_latestFrameId = 0;
+	alignas(64) volatile LONG m_latestFrameSlotId = -1;
+	alignas(64) volatile LONG64 m_droppedFrameCount = 0;
 
 
 	// Capture Image
