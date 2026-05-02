@@ -62,10 +62,7 @@ struct SharedCaptureData
 	bool newFrame = false;
 };
 
-namespace RYLYNN
-{
-	class ImageView;
-}
+class D3D11ImageView;
 
 struct CaptureCallbackContext
 {
@@ -75,7 +72,7 @@ struct CaptureCallbackContext
 	CaptureFrameResult* captureFrame = nullptr;
 
 	SharedCaptureData* sharedData = nullptr;
-	RYLYNN::ImageView* imageView = nullptr;
+	D3D11ImageView* imageView = nullptr;
 	ID3D11Device* D3D11Device = nullptr;
 
 	HANDLE lastHandle = nullptr;
