@@ -13,36 +13,45 @@ D3D11DuplicateEngine::~D3D11DuplicateEngine()
 	Shutdown();
 }
 
-bool D3D11DuplicateEngine::Initialize(uint32_t outputIndex)
+bool D3D11DuplicateEngine::Initialize(D3D11RenderEngine* D3D11Engine, uint32_t outputIndex)
 {
 	if (IsInitialized())
 	{
 		Shutdown();
 	}
 
-	// Rendering Engine
-	RenderEngineConfig renderEngineConfig = {};
-	renderEngineConfig.initD2D = false;
-	renderEngineConfig.initD3D = true;
-#if defined(_DEBUG)
-	renderEngineConfig.initDebugLayer = true;
-#endif
-	renderEngineConfig.initFontManager = false;
-
-	m_D3D11Engine = new D3D11RenderEngine();
-	if (!m_D3D11Engine)
-		return false;
-
-	if (!m_D3D11Engine->Initialize(renderEngineConfig))
+	if (D3D11Engine)
 	{
-		Shutdown();
-		return false;
+		m_D3D11Engine = D3D11Engine;
+		m_ownsD3D11Engine = false;
 	}
-
-	if (!m_D3D11Engine || !m_D3D11Engine->IsDeviceAvailable())
+	else
 	{
-		Shutdown();
-		return false;
+		// Rendering Engine
+		RenderEngineConfig renderEngineConfig = {};
+		renderEngineConfig.initD2D = false;
+		renderEngineConfig.initD3D = true;
+#if defined(_DEBUG)
+		renderEngineConfig.initDebugLayer = true;
+#endif
+		renderEngineConfig.initFontManager = false;
+
+		m_D3D11Engine = new D3D11RenderEngine();
+		if (!m_D3D11Engine)
+			return false;
+		m_ownsD3D11Engine = true;
+
+		if (!m_D3D11Engine->Initialize(renderEngineConfig))
+		{
+			Shutdown();
+			return false;
+		}
+
+		if (!m_D3D11Engine || !m_D3D11Engine->IsDeviceAvailable())
+		{
+			Shutdown();
+			return false;
+		}
 	}
 
 	m_WICImageIO = new D3D11ImageIO();
@@ -127,11 +136,12 @@ void D3D11DuplicateEngine::Shutdown()
 	ZeroMemory(&m_mouseInfo.position, sizeof(m_mouseInfo.position));
 	ZeroMemory(&m_mouseInfo.lastTimeStamp, sizeof(m_mouseInfo.lastTimeStamp));
 
-	if (m_D3D11Engine)
+	if (m_ownsD3D11Engine && m_D3D11Engine)
 	{
 		delete m_D3D11Engine;
-		m_D3D11Engine = nullptr;
 	}
+	m_D3D11Engine = nullptr;
+	m_ownsD3D11Engine = false;
 
 	m_initialized = false;
 }
@@ -406,6 +416,7 @@ void D3D11DuplicateEngine::ReleaseLatestFrameHandle(CapturedFrameHandle& handle)
 		handle.texture = nullptr;
 		handle.slotId = -1;
 		handle.frameId = 0ULL;
+		__debugbreak();
 		return;
 	}
 
@@ -417,6 +428,7 @@ void D3D11DuplicateEngine::ReleaseLatestFrameHandle(CapturedFrameHandle& handle)
 	if (referenceCount < 0)
 	{
 		::InterlockedExchange(&frameSlot.referenceCount, 0);
+		__debugbreak();
 	}
 
 	handle.texture = nullptr;

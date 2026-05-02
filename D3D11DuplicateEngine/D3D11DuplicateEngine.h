@@ -23,7 +23,7 @@ public:
 	D3D11DuplicateEngine() = default;
 	~D3D11DuplicateEngine();
 
-	bool Initialize(uint32_t outputIndex = 0);
+	bool Initialize(D3D11RenderEngine* D3D11Engine = nullptr, uint32_t outputIndex = 0);
 	bool IsInitialized() const { return m_initialized; }
 	void Shutdown();
 
@@ -76,6 +76,7 @@ private:
 
 	// Render Engine
 	D3D11RenderEngine* m_D3D11Engine = nullptr;
+	bool m_ownsD3D11Engine = false;
 
 	IDXGIOutput1* m_dxgiOutput = nullptr;
 	IDXGIOutputDuplication* m_deskDupl = nullptr;
