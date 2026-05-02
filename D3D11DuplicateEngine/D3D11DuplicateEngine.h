@@ -34,9 +34,6 @@ public:
 	uint32_t GetOutputWidth();
 	uint32_t GetOutputHeight();
 
-	bool AcquireFrame(UINT timeout_ms, CaptureFrameResult& outResult);
-	void ReleaseFrame();
-
 	// Capture Thread
 	bool StartThread();
 	void StopThread();
@@ -67,6 +64,9 @@ private:
 
 	// Capture Thread
 	void ProcessCaptureFrame();
+
+	bool AcquireFrame(UINT timeout_ms, CaptureFrameResult& outResult);
+	void ReleaseFrame();
 
 private:
 	bool m_initialized = false;
