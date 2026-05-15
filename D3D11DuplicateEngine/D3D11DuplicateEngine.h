@@ -97,7 +97,7 @@ private:
 
 
 	// Capture Image
-	bool m_enableSharedTexture = true;
+	bool m_enableSharedTexture = false;
 	HANDLE m_sharedHandle = nullptr;
 	ID3D11Texture2D* m_capturedTexture = nullptr; // 현재 잡고 있는 프레임
 	ID3D11Texture2D* m_sharedTexture = nullptr; // 로컬 공유용 버퍼
