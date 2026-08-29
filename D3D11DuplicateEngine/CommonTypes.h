@@ -29,6 +29,12 @@ struct CaptureFrameResult
 	PTR_INFO mouseInfo = {};   // 마우스 위치 및 모양
 };
 
+enum class CaptureOutputMode : uint32_t
+{
+	FramePool = 0,
+	SharedTexture,
+};
+
 enum FrameStatus : LONG
 {
 	EMPTY = 0,

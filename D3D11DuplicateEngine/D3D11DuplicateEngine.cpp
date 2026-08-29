@@ -8,6 +8,12 @@
 
 using namespace Core::DirectX;
 
+namespace
+{
+	constexpr UINT64 kCaptureAcquireKey = 0;
+	constexpr UINT64 kViewerAcquireKey = 1;
+}
+
 D3D11DuplicateEngine::~D3D11DuplicateEngine()
 {
 	Shutdown();
@@ -74,7 +80,7 @@ bool D3D11DuplicateEngine::Initialize(D3D11RenderEngine* D3D11Engine, uint32_t o
 		return false;
 	}
 
-	if (m_enableSharedTexture)
+	if (m_captureOutputMode == CaptureOutputMode::SharedTexture)
 	{
 		hr = CreateSharedTexture(m_duplDesc.ModeDesc.Width, m_duplDesc.ModeDesc.Height, &m_sharedTexture, &m_sharedHandle);
 		if (FAILED(hr))
@@ -82,9 +88,24 @@ bool D3D11DuplicateEngine::Initialize(D3D11RenderEngine* D3D11Engine, uint32_t o
 			Shutdown();
 			return false;
 		}
-	}
 
-	if (!InitializeCaptureFramePool())
+		hr = m_sharedTexture->QueryInterface(
+			__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&m_sharedKeyedMutex));
+		if (FAILED(hr) || !m_sharedKeyedMutex)
+		{
+			Shutdown();
+			return false;
+		}
+	}
+	else if (m_captureOutputMode == CaptureOutputMode::FramePool)
+	{
+		if (!InitializeCaptureFramePool())
+		{
+			Shutdown();
+			return false;
+		}
+	}
+	else
 	{
 		Shutdown();
 		return false;
@@ -111,6 +132,7 @@ void D3D11DuplicateEngine::Shutdown()
 	SafeRelease(m_dxgiOutput);
 	SafeRelease(m_deskDupl);
 	SafeRelease(m_capturedTexture);
+	SafeRelease(m_sharedKeyedMutex);
 	SafeRelease(m_sharedTexture);
 
 	m_frameAcquired = false;
@@ -144,6 +166,18 @@ void D3D11DuplicateEngine::Shutdown()
 	m_ownsD3D11Engine = false;
 
 	m_initialized = false;
+}
+
+bool D3D11DuplicateEngine::SetCaptureOutputMode(CaptureOutputMode outputMode)
+{
+	if (IsInitialized())
+		return false;
+
+	if (outputMode != CaptureOutputMode::FramePool && outputMode != CaptureOutputMode::SharedTexture)
+		return false;
+
+	m_captureOutputMode = outputMode;
+	return true;
 }
 
 void D3D11DuplicateEngine::SetTargetFps(uint64_t fps)
@@ -262,10 +296,43 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT timeout_ms, CaptureFrameResult& out
 		}
 	}
 
-	// 로컬 뷰어용 공유 텍스쳐 복사
-	if (m_sharedTexture)
+	bool sharedFrameReady = false;
+
+	// 공유 텍스처는 캡처 장치와 뷰어 장치가 번갈아 소유한다. 뷰어가 아직
+	// 이전 프레임을 읽고 있다면 캡처 스레드를 막지 않고 이번 프레임을 버린다.
+	if (m_captureOutputMode == CaptureOutputMode::SharedTexture)
 	{
-		m_D3D11Engine->GetD3DDeviceContext()->CopyResource(m_sharedTexture, m_capturedTexture);
+		if (!m_sharedTexture || !m_sharedKeyedMutex)
+		{
+			ReleaseFrame();
+			return false;
+		}
+
+		const HRESULT acquireHr = m_sharedKeyedMutex->AcquireSync(kCaptureAcquireKey, 0);
+		if (acquireHr == WAIT_TIMEOUT)
+		{
+			::InterlockedIncrement64(&m_droppedFrameCount);
+		}
+		else if (acquireHr == WAIT_ABANDONED || FAILED(acquireHr))
+		{
+			ReleaseFrame();
+			return false;
+		}
+		else
+		{
+			ID3D11DeviceContext* deviceContext = m_D3D11Engine->GetD3DDeviceContext();
+			deviceContext->CopyResource(m_sharedTexture, m_capturedTexture);
+			deviceContext->Flush();
+
+			const HRESULT releaseHr = m_sharedKeyedMutex->ReleaseSync(kViewerAcquireKey);
+			if (FAILED(releaseHr))
+			{
+				ReleaseFrame();
+				return false;
+			}
+
+			sharedFrameReady = true;
+		}
 	}
 
 	//if (m_WICImageIO)
@@ -283,7 +350,7 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT timeout_ms, CaptureFrameResult& out
 
 	// 결과 저장
 	outResult.texture = m_capturedTexture;
-	outResult.sharedHandle = m_enableSharedTexture == true ? m_sharedHandle : nullptr;
+	outResult.sharedHandle = sharedFrameReady ? m_sharedHandle : nullptr;
 	outResult.frameInfo = frameInfo;
 	if (m_useMouseInfo)
 	{
@@ -451,6 +518,14 @@ ID3D11Device1* D3D11DuplicateEngine::GetD3DDevice()
 	return m_D3D11Engine->GetD3DDevice();
 }
 
+HANDLE D3D11DuplicateEngine::GetSharedTextureHandle() const
+{
+	if (!IsInitialized() || m_captureOutputMode != CaptureOutputMode::SharedTexture)
+		return nullptr;
+
+	return m_sharedHandle;
+}
+
 bool D3D11DuplicateEngine::StartThread()
 {
 	if (!IsInitialized())
@@ -492,23 +567,19 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 	if (!captureFrame.texture)
 		return;
 
-	CopyCaptureTextureToPool(captureFrame.texture, captureFrame.frameInfo, captureFrame.mouseInfo);
-
-	CaptureCallbackContext* context = static_cast<CaptureCallbackContext*>(m_userData);
-
-	if (m_enableSharedTexture && m_sharedHandle && context && context->sharedData)
+	if (m_captureOutputMode == CaptureOutputMode::SharedTexture && !captureFrame.sharedHandle)
 	{
-		SharedCaptureData* sharedData = context->sharedData;
-
-		::AcquireSRWLockExclusive(&sharedData->lock);
-		sharedData->sharedHandle = m_sharedHandle;
-		sharedData->newFrame = true;
-		::ReleaseSRWLockExclusive(&sharedData->lock);
+		ReleaseFrame();
+		return;
 	}
 
-	if (m_frameCallback && context)
+	if (m_captureOutputMode == CaptureOutputMode::FramePool)
 	{
-		context->captureFrame = &captureFrame;
+		CopyCaptureTextureToPool(captureFrame.texture, captureFrame.frameInfo, captureFrame.mouseInfo);
+	}
+
+	if (m_frameCallback)
+	{
 		m_frameCallback(m_userData);
 	}
 
@@ -527,7 +598,7 @@ HRESULT D3D11DuplicateEngine::CreateSharedTexture(UINT width, UINT height, ID3D1
 	desc.SampleDesc.Count = 1;
 	desc.Usage = D3D11_USAGE_DEFAULT;
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED; // 핵심: 공유 플래그
+	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
 	HRESULT hr = m_D3D11Engine->GetD3DDevice()->CreateTexture2D(&desc, nullptr, texture);
 	if (FAILED(hr)) return hr;

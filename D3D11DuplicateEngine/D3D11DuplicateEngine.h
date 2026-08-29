@@ -14,6 +14,7 @@ class D3D11ImageIO;
 class D3D11DuplicateThread;
 struct IDXGIOutput1;
 struct IDXGIOutputDuplication;
+struct IDXGIKeyedMutex;
 
 using FrameCallback = void(*)(void* userData);
 
@@ -26,6 +27,8 @@ public:
 	bool Initialize(D3D11RenderEngine* D3D11Engine = nullptr, uint32_t outputIndex = 0);
 	bool IsInitialized() const { return m_initialized; }
 	void Shutdown();
+	bool SetCaptureOutputMode(CaptureOutputMode outputMode);
+	CaptureOutputMode GetCaptureOutputMode() const { return m_captureOutputMode; }
 
 	void SetTargetFps(uint64_t fps);
 	uint64_t GetTargetFps() const;
@@ -45,6 +48,7 @@ public:
 	uint64_t GetDroppedFrameCount();
 
 	ID3D11Device1* GetD3DDevice();
+	HANDLE GetSharedTextureHandle() const;
 
 private:
 	friend class D3D11DuplicateThread;
@@ -97,10 +101,11 @@ private:
 
 
 	// Capture Image
-	bool m_enableSharedTexture = false;
+	CaptureOutputMode m_captureOutputMode = CaptureOutputMode::FramePool;
 	HANDLE m_sharedHandle = nullptr;
 	ID3D11Texture2D* m_capturedTexture = nullptr; // 현재 잡고 있는 프레임
 	ID3D11Texture2D* m_sharedTexture = nullptr; // 로컬 공유용 버퍼
+	IDXGIKeyedMutex* m_sharedKeyedMutex = nullptr;
 	bool m_frameAcquired = false;
 
 	BYTE* m_metaDataBuffer = nullptr;
