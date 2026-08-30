@@ -5,7 +5,7 @@ Windows D3D11-based screen capture DLL using the DXGI Desktop Duplication API
 Modular C++ screen capture engine for Windows built on Direct3D 11 and DXGI Desktop Duplication.
 Provides desktop frame acquisition, shared texture output, dirty/move rect metadata, mouse pointer state tracking, and optional frame callback processing for external applications or viewer modules.
 
-This project is designed as a DLL-based capture component and integrates shared sibling modules from `Core`, `D3D11Engine`, and `D3D11ImageIO`.
+This project is designed as a DLL-based capture component and integrates shared sibling modules from `Core` and `D3D11Engine`.
 
 # Features
 - DXGI Desktop Duplication API-based desktop capture
@@ -14,13 +14,11 @@ This project is designed as a DLL-based capture component and integrates shared 
 - Dirty rect and move rect metadata extraction
 - Mouse pointer position and shape tracking
 - Capture thread support with callback-based processing
-- Optional texture export/debug support via D3D11 image I/O
 - Modular integration with shared sibling libraries
 
 # Dependencies
 - Core
 - D3D11Engine
-- D3D11ImageIO
 - Windows Direct3D 11 / DXGI 1.2+
 - C++20
 - MSVC (Visual Studio 2022)
@@ -35,26 +33,24 @@ This project is designed as a DLL-based capture component and integrates shared 
 - `D3D11DuplicateEngine/D3D11DuplicateEngine.h` : public engine interface
 - `D3D11DuplicateEngine/D3D11DuplicateEngine.cpp` : DXGI duplication initialization and frame capture logic
 - `D3D11DuplicateEngine/D3D11DuplicateThread.*` : capture worker thread implementation
-- `D3D11DuplicateEngine/CommonTypes.h` : shared capture result and callback-related structures
+- `D3D11DuplicateEngine/CommonTypes.h` : common capture result and frame-pool structures
 - `Shaders/` : precompiled shader objects used by related D3D11 modules
 - `D3D11DuplicateEngine.sln` : Visual Studio solution
 
 # Repository Layout
-This project expects `D3D11DuplicateEngine`, `Core`, `D3D11Engine`, and `D3D11ImageIO` to be placed under the same parent directory.
+This project expects `D3D11DuplicateEngine`, `Core`, and `D3D11Engine` to be placed under the same parent directory.
 
 Example:
 ```text
 Module/
 +-- Core/
 +-- D3D11Engine/
-+-- D3D11ImageIO/
 +-- D3D11DuplicateEngine/
 ```
 
 The Visual Studio solution references shared projects by sibling paths:
 - `../Core/Core/Core.vcxproj`
 - `../D3D11Engine/D3D11Engine/D3D11Engine.vcxproj`
-- `../D3D11ImageIO/D3D11ImageIO/D3D11ImageIO.vcxproj`
 
 # Notes
 - Shared libraries are managed as sibling repositories/projects, not as Git submodules.

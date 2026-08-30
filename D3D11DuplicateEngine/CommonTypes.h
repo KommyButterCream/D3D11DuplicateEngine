@@ -60,31 +60,3 @@ struct CapturedFrameHandle
 	LONG slotId = -1;
 	uint64_t frameId = 0ULL;
 };
-
-struct SharedCaptureData
-{
-	HANDLE sharedHandle = nullptr;
-	SRWLOCK lock = SRWLOCK_INIT;
-	bool newFrame = false;
-};
-
-class D3D11ImageView;
-
-struct CaptureCallbackContext
-{
-	bool isProcessing = false;
-	void* ownerData = nullptr;
-
-	CaptureFrameResult* captureFrame = nullptr;
-
-	SharedCaptureData* sharedData = nullptr;
-	D3D11ImageView* imageView = nullptr;
-	ID3D11Device* D3D11Device = nullptr;
-
-	HANDLE lastHandle = nullptr;
-	ID3D11Texture2D* opendTexture = nullptr;
-
-	ID3D11Texture2D* stagingTex = nullptr; // CPU 읽기용 텍스처
-	uint32_t lastWidth = 0;
-	uint32_t lastHeight = 0;
-};

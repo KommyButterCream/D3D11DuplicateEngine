@@ -10,7 +10,6 @@
 #include "CommonTypes.h"
 
 class D3D11RenderEngine;
-class D3D11ImageIO;
 class D3D11DuplicateThread;
 struct IDXGIOutput1;
 struct IDXGIOutputDuplication;
@@ -29,6 +28,10 @@ public:
 	void Shutdown();
 	bool SetCaptureOutputMode(CaptureOutputMode outputMode);
 	CaptureOutputMode GetCaptureOutputMode() const { return m_captureOutputMode; }
+	bool SetImmediateContextGateEnabled(bool enabled);
+	bool IsImmediateContextGateEnabled() const;
+	bool SetWaitForFrameCopyCompletion(bool enabled);
+	bool IsWaitForFrameCopyCompletionEnabled() const { return m_waitForFrameCopyCompletion; }
 
 	void SetTargetFps(uint64_t fps);
 	uint64_t GetTargetFps() const;
@@ -81,6 +84,8 @@ private:
 	// Render Engine
 	D3D11RenderEngine* m_D3D11Engine = nullptr;
 	bool m_ownsD3D11Engine = false;
+	bool m_immediateContextGateEnabled = false;
+	bool m_immediateContextGateSettingExplicit = false;
 
 	IDXGIOutput1* m_dxgiOutput = nullptr;
 	IDXGIOutputDuplication* m_deskDupl = nullptr;
@@ -102,6 +107,7 @@ private:
 
 	// Capture Image
 	CaptureOutputMode m_captureOutputMode = CaptureOutputMode::FramePool;
+	bool m_waitForFrameCopyCompletion = true;
 	HANDLE m_sharedHandle = nullptr;
 	ID3D11Texture2D* m_capturedTexture = nullptr; // 현재 잡고 있는 프레임
 	ID3D11Texture2D* m_sharedTexture = nullptr; // 로컬 공유용 버퍼
@@ -117,8 +123,5 @@ private:
 
 	FrameCallback m_frameCallback = nullptr;
 	void* m_userData = nullptr;
-
-	// Debug
-	D3D11ImageIO* m_WICImageIO = nullptr;
 };
 

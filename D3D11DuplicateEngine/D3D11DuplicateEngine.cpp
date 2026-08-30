@@ -3,7 +3,6 @@
 #include "D3D11DuplicateThread.h"
 
 #include "../../../Module/D3D11Engine/Core/D3D11RenderEngine.h"
-#include "../../../Module/D3D11ImageIO/D3D11ImageIO/D3D11ImageIO.h"
 #include "../../../Module/Core/DirectX/DxSafeRelease.h"  // for SafeRelease
 
 using namespace Core::DirectX;
@@ -30,6 +29,17 @@ bool D3D11DuplicateEngine::Initialize(D3D11RenderEngine* D3D11Engine, uint32_t o
 	{
 		m_D3D11Engine = D3D11Engine;
 		m_ownsD3D11Engine = false;
+
+		if (m_immediateContextGateSettingExplicit &&
+			m_D3D11Engine->IsImmediateContextGateEnabled() != m_immediateContextGateEnabled)
+		{
+			// An external engine must be configured before it is initialized.
+			if (!m_D3D11Engine->SetImmediateContextGateEnabled(m_immediateContextGateEnabled))
+			{
+				m_D3D11Engine = nullptr;
+				return false;
+			}
+		}
 	}
 	else
 	{
@@ -47,6 +57,12 @@ bool D3D11DuplicateEngine::Initialize(D3D11RenderEngine* D3D11Engine, uint32_t o
 			return false;
 		m_ownsD3D11Engine = true;
 
+		if (!m_D3D11Engine->SetImmediateContextGateEnabled(m_immediateContextGateEnabled))
+		{
+			Shutdown();
+			return false;
+		}
+
 		if (!m_D3D11Engine->Initialize(renderEngineConfig))
 		{
 			Shutdown();
@@ -58,19 +74,6 @@ bool D3D11DuplicateEngine::Initialize(D3D11RenderEngine* D3D11Engine, uint32_t o
 			Shutdown();
 			return false;
 		}
-	}
-
-	m_WICImageIO = new D3D11ImageIO();
-	if (!m_WICImageIO)
-	{
-		Shutdown();
-		return false;
-	}
-
-	if (FAILED(m_WICImageIO->Initialize()))
-	{
-		Shutdown();
-		return false;
 	}
 
 	HRESULT hr = InitializeDuplication(outputIndex);
@@ -123,12 +126,6 @@ void D3D11DuplicateEngine::Shutdown()
 
 	DestroyCaptureFramePool();
 
-	if (m_WICImageIO)
-	{
-		delete m_WICImageIO;
-		m_WICImageIO = nullptr;
-	}
-
 	SafeRelease(m_dxgiOutput);
 	SafeRelease(m_deskDupl);
 	SafeRelease(m_capturedTexture);
@@ -178,6 +175,32 @@ bool D3D11DuplicateEngine::SetCaptureOutputMode(CaptureOutputMode outputMode)
 
 	m_captureOutputMode = outputMode;
 	return true;
+}
+
+bool D3D11DuplicateEngine::SetWaitForFrameCopyCompletion(bool enabled)
+{
+	if (IsInitialized())
+		return false;
+
+	m_waitForFrameCopyCompletion = enabled;
+	return true;
+}
+
+bool D3D11DuplicateEngine::SetImmediateContextGateEnabled(bool enabled)
+{
+	if (IsInitialized())
+		return false;
+
+	m_immediateContextGateEnabled = enabled;
+	m_immediateContextGateSettingExplicit = true;
+	return true;
+}
+
+bool D3D11DuplicateEngine::IsImmediateContextGateEnabled() const
+{
+	return m_D3D11Engine
+		? m_D3D11Engine->IsImmediateContextGateEnabled()
+		: m_immediateContextGateEnabled;
 }
 
 void D3D11DuplicateEngine::SetTargetFps(uint64_t fps)
@@ -321,8 +344,18 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT timeout_ms, CaptureFrameResult& out
 		else
 		{
 			ID3D11DeviceContext* deviceContext = m_D3D11Engine->GetD3DDeviceContext();
-			deviceContext->CopyResource(m_sharedTexture, m_capturedTexture);
-			deviceContext->Flush();
+			if (!deviceContext)
+			{
+				m_sharedKeyedMutex->ReleaseSync(kCaptureAcquireKey);
+				ReleaseFrame();
+				return false;
+			}
+
+			{
+				D3D11ImmediateContextGuard contextGuard(m_D3D11Engine->GetImmediateContextGate());
+				deviceContext->CopyResource(m_sharedTexture, m_capturedTexture);
+				deviceContext->Flush();
+			}
 
 			const HRESULT releaseHr = m_sharedKeyedMutex->ReleaseSync(kViewerAcquireKey);
 			if (FAILED(releaseHr))
@@ -334,19 +367,6 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT timeout_ms, CaptureFrameResult& out
 			sharedFrameReady = true;
 		}
 	}
-
-	//if (m_WICImageIO)
-	//{
-	//	if (FAILED(m_WICImageIO->SaveTextureToFile(
-	//		m_D3D11Engine->GetD3DDevice(),
-	//		m_D3D11Engine->GetD3DDeviceContext(),
-	//		m_capturedTexture,
-	//		L"C:\\debug\\desktop.bmp"
-	//	)))
-	//	{
-	//		return false;
-	//	}
-	//}
 
 	// 결과 저장
 	outResult.texture = m_capturedTexture;
@@ -364,6 +384,11 @@ void D3D11DuplicateEngine::ReleaseFrame()
 {
 	if (m_deskDupl && m_frameAcquired)
 	{
+		// ReleaseFrame transitions ownership of the duplicated desktop resource.
+		// Serialize that transition with immediate-context work for the previous
+		// frame that may still be running on the encoder thread.
+		D3D11ImmediateContextGuard contextGuard(
+			m_D3D11Engine ? m_D3D11Engine->GetImmediateContextGate() : nullptr);
 		HRESULT hr = m_deskDupl->ReleaseFrame();
 		m_frameAcquired = false;
 
@@ -578,12 +603,15 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 		CopyCaptureTextureToPool(captureFrame.texture, captureFrame.frameInfo, captureFrame.mouseInfo);
 	}
 
+	// Return the duplicated desktop resource before notifying consumers. The
+	// callback may immediately start encoder work on another thread using the
+	// same device, which must not overlap the duplication ownership transition.
+	ReleaseFrame();
+
 	if (m_frameCallback)
 	{
 		m_frameCallback(m_userData);
 	}
-
-	ReleaseFrame();
 }
 
 // 로컬 뷰어(ImageViewer.dll)와 Zero-Copy를 위한 텍스처 생성
@@ -646,11 +674,14 @@ bool D3D11DuplicateEngine::InitializeCaptureFramePool()
 		if (FAILED(hr))
 			return false;
 
-		D3D11_QUERY_DESC queryDesc = {};
-		queryDesc.Query = D3D11_QUERY_EVENT;
-		hr = m_D3D11Engine->GetD3DDevice()->CreateQuery(&queryDesc, &frameSlot.copyDoneQuery);
-		if (FAILED(hr))
-			return false;
+		if (m_waitForFrameCopyCompletion)
+		{
+			D3D11_QUERY_DESC queryDesc = {};
+			queryDesc.Query = D3D11_QUERY_EVENT;
+			hr = m_D3D11Engine->GetD3DDevice()->CreateQuery(&queryDesc, &frameSlot.copyDoneQuery);
+			if (FAILED(hr))
+				return false;
+		}
 	}
 
 	return true;
@@ -708,10 +739,27 @@ void D3D11DuplicateEngine::CopyCaptureTextureToPool(ID3D11Texture2D* capturedTex
 			continue;
 		}
 
-		m_D3D11Engine->GetD3DDeviceContext()->CopyResource(frameSlot.texture, capturedTexture);
-		if (frameSlot.copyDoneQuery)
 		{
-			m_D3D11Engine->GetD3DDeviceContext()->End(frameSlot.copyDoneQuery);
+			D3D11ImmediateContextGuard contextGuard(m_D3D11Engine->GetImmediateContextGate());
+			ID3D11DeviceContext* context = m_D3D11Engine->GetD3DDeviceContext();
+			if (!context)
+			{
+				::InterlockedExchange(&frameSlot.status, previousStatus);
+				return;
+			}
+
+			context->CopyResource(frameSlot.texture, capturedTexture);
+			if (frameSlot.copyDoneQuery)
+			{
+				context->End(frameSlot.copyDoneQuery);
+			}
+			else
+			{
+				// Without GetData there is no implicit command-buffer submission.
+				// Submit the copy before the duplication frame is released while
+				// keeping the capture thread non-blocking.
+				context->Flush();
+			}
 		}
 
 		frameSlot.frameInfo = frameInfo;
@@ -747,7 +795,11 @@ bool D3D11DuplicateEngine::WaitForFrameSlotCopy(CapturedFrameSlot& frameSlot)
 
 	for (;;)
 	{
-		const HRESULT hr = context->GetData(frameSlot.copyDoneQuery, nullptr, 0, 0);
+		HRESULT hr = S_FALSE;
+		{
+			D3D11ImmediateContextGuard contextGuard(m_D3D11Engine->GetImmediateContextGate());
+			hr = context->GetData(frameSlot.copyDoneQuery, nullptr, 0, 0);
+		}
 		if (hr == S_OK)
 			return true;
 
