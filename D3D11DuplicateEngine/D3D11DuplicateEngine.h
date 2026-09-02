@@ -17,6 +17,11 @@ struct IDXGIKeyedMutex;
 
 using FrameCallback = void(*)(void* userData);
 
+// 캐시 라인 정렬(alignas(64)) 때문에 구조체 끝에 패딩이 붙는다. 의도한 것이므로
+// 이 헤더를 /W4 로 가져다 쓰는 쪽에 경고가 새어 나가지 않게 막는다.
+#pragma warning(push)
+#pragma warning(disable: 4324)
+
 class D3D11_DUPLICATE_ENGINE_API D3D11DuplicateEngine
 {
 public:
@@ -33,6 +38,17 @@ public:
 	bool SetWaitForFrameCopyCompletion(bool enabled);
 	bool IsWaitForFrameCopyCompletionEnabled() const { return m_waitForFrameCopyCompletion; }
 
+	// 데스크톱 이미지가 갱신되지 않은 프레임(마우스만 움직인 경우)의 복사와
+	// 발행을 건너뛴다. 기본값 켜짐. 정지 화면에서 인코딩 부하가 사라진다.
+	//
+	// duplication 은 포인터만 움직여도 프레임을 돌려주는데, 그때
+	// frameInfo.LastPresentTime 이 0 이고 화면 내용은 직전과 동일하다.
+	// 소비자가 포인터 갱신마다 프레임을 받아야 하는 경우에만 끈다.
+	//
+	// 언제든 바꿀 수 있다.
+	void SetSkipUnchangedFrames(bool enabled);
+	bool IsSkipUnchangedFramesEnabled() const;
+
 	void SetTargetFps(uint64_t fps);
 	uint64_t GetTargetFps() const;
 
@@ -45,6 +61,20 @@ public:
 	void StopThread();
 
 	void SetFrameCaptureCallback(FrameCallback funcCallback, void* userData); // 스레드에서 호출 할 함수 등록
+
+	// 접근 상실 / 디바이스 상실 / 재연결 같은 사건을 통지받는다.
+	// 캡처 스레드에서 불리므로 블로킹 작업을 하면 안 된다.
+	void SetCaptureEventCallback(CaptureEventCallback funcCallback, void* userData);
+
+	CaptureState GetCaptureState() const;
+	bool IsFaulted() const { return GetCaptureState() == CaptureState::Faulted; }
+
+	CaptureStats GetStats() const;
+	void ResetStats();
+
+	// 테스트 전용 훅. 다음 캡처 반복에서 duplication 접근 상실이 일어난 것처럼
+	// 만들어 재연결 경로를 강제로 태운다. 운영 코드에서 호출하지 않는다.
+	void DebugSimulateAccessLoss();
 
 	CapturedFrameHandle GetLatestFrameHandle();
 	void ReleaseLatestFrameHandle(CapturedFrameHandle& handle);
@@ -68,6 +98,22 @@ private:
 
 	bool UpdateMouseInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo);
 	bool UpdateDirtyMoveInfo(DXGI_OUTDUPL_FRAME_INFO& frameInfo, CaptureFrameResult& outResult);
+
+	void SetCaptureState(CaptureState state);
+	void NotifyEvent(CaptureEventCode code, HRESULT hr);
+	void RecordError(HRESULT hr);
+
+	// 출력 리소스(프레임 풀 또는 공유 텍스처)를 현재 m_duplDesc 기준으로 만든다.
+	bool CreateFrameResources();
+	void DestroyFrameResources();
+
+	// 복구
+	bool IsDeviceLost() const;
+	void EnterReconnecting(HRESULT hr);
+	void EnterFaulted(CaptureEventCode code, HRESULT hr);
+	void BackoffReconnectDelay();
+	bool RecreateLostDevice();
+	void RecoverDuplication();
 
 	// Capture Thread
 	void ProcessCaptureFrame();
@@ -103,6 +149,31 @@ private:
 	alignas(64) volatile LONG64 m_latestFrameId = 0;
 	alignas(64) volatile LONG m_latestFrameSlotId = -1;
 	alignas(64) volatile LONG64 m_droppedFrameCount = 0;
+	// 잘못된 핸들 반납 횟수. 예전에는 __debugbreak 로 세웠던 자리다.
+	alignas(64) volatile LONG64 m_invalidReleaseCount = 0;
+
+	// 화면 갱신이 없는 프레임을 건너뛸지. 캡처 스레드가 매 프레임 읽으므로 원자적.
+	volatile LONG m_skipUnchangedFrames = TRUE;
+
+	// Stats / State
+	alignas(64) volatile LONG64 m_capturedFrameCount = 0;
+	volatile LONG64 m_skippedFrameCount = 0;
+	volatile LONG64 m_timeoutCount = 0;
+	volatile LONG64 m_accessLostCount = 0;
+	volatile LONG64 m_reconnectCount = 0;
+	volatile LONG64 m_deviceRecreateCount = 0;
+	volatile LONG m_lastError = S_OK;
+	alignas(64) volatile LONG m_captureState = static_cast<LONG>(CaptureState::Idle);
+
+	// 복구. 전부 캡처 스레드 전용이라 원자성이 필요 없다.
+	uint32_t m_reconnectAttempt = 0;
+	uint32_t m_reconnectDelayMs = 0;
+	bool m_deviceRemovedNotified = false;
+	volatile LONG m_debugForceAccessLoss = FALSE;
+
+	// 현재 출력 리소스가 맞춰진 크기. 재연결 후 해상도 변경 감지에 쓴다.
+	uint32_t m_frameWidth = 0;
+	uint32_t m_frameHeight = 0;
 
 
 	// Capture Image
@@ -123,5 +194,10 @@ private:
 
 	FrameCallback m_frameCallback = nullptr;
 	void* m_userData = nullptr;
+
+	CaptureEventCallback m_eventCallback = nullptr;
+	void* m_eventUserData = nullptr;
 };
+
+#pragma warning(pop)
 

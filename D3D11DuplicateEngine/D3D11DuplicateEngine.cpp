@@ -11,6 +11,16 @@ namespace
 {
 	constexpr UINT64 kCaptureAcquireKey = 0;
 	constexpr UINT64 kViewerAcquireKey = 1;
+
+	constexpr UINT kAcquireTimeoutMs = 500;
+
+	// 재연결 백오프. 보안 데스크톱 전환은 보통 1~2 초 안에 끝나므로
+	// 짧게 시작해 500ms 까지만 늘린다.
+	constexpr uint32_t kReconnectMinDelayMs = 50;
+	constexpr uint32_t kReconnectMaxDelayMs = 500;
+
+	// 재연결이 길어질 때 통지 폭주를 막는 간격(시도 횟수 기준).
+	constexpr uint32_t kReconnectNotifyInterval = 20;
 }
 
 D3D11DuplicateEngine::~D3D11DuplicateEngine()
@@ -76,46 +86,25 @@ bool D3D11DuplicateEngine::Initialize(D3D11RenderEngine* D3D11Engine, uint32_t o
 		}
 	}
 
-	HRESULT hr = InitializeDuplication(outputIndex);
+	// 재연결 경로가 이 값을 쓰므로 duplication 을 열기 전에 확정한다.
+	m_outputIndex = outputIndex;
+
+	const HRESULT hr = InitializeDuplication(outputIndex);
 	if (FAILED(hr))
 	{
+		RecordError(hr);
 		Shutdown();
 		return false;
 	}
 
-	if (m_captureOutputMode == CaptureOutputMode::SharedTexture)
-	{
-		hr = CreateSharedTexture(m_duplDesc.ModeDesc.Width, m_duplDesc.ModeDesc.Height, &m_sharedTexture, &m_sharedHandle);
-		if (FAILED(hr))
-		{
-			Shutdown();
-			return false;
-		}
-
-		hr = m_sharedTexture->QueryInterface(
-			__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&m_sharedKeyedMutex));
-		if (FAILED(hr) || !m_sharedKeyedMutex)
-		{
-			Shutdown();
-			return false;
-		}
-	}
-	else if (m_captureOutputMode == CaptureOutputMode::FramePool)
-	{
-		if (!InitializeCaptureFramePool())
-		{
-			Shutdown();
-			return false;
-		}
-	}
-	else
+	if (!CreateFrameResources())
 	{
 		Shutdown();
 		return false;
 	}
 
-	m_outputIndex = outputIndex;
 	m_initialized = true;
+	SetCaptureState(CaptureState::Running);
 
 	return true;
 }
@@ -124,16 +113,22 @@ void D3D11DuplicateEngine::Shutdown()
 {
 	StopThread();
 
-	DestroyCaptureFramePool();
+	// duplication 을 쥔 채로 놓아버리면 표면 소유권이 DWM 에 돌아가지 않는다.
+	ReleaseFrame();
+
+	DestroyFrameResources();
 
 	SafeRelease(m_dxgiOutput);
 	SafeRelease(m_deskDupl);
 	SafeRelease(m_capturedTexture);
-	SafeRelease(m_sharedKeyedMutex);
-	SafeRelease(m_sharedTexture);
 
 	m_frameAcquired = false;
-	m_sharedHandle = nullptr;
+
+	m_reconnectAttempt = 0;
+	m_reconnectDelayMs = kReconnectMinDelayMs;
+	m_deviceRemovedNotified = false;
+	m_duplDesc = {};
+	m_outputDesc = {};
 
 	if (m_mouseInfo.shapeBuffer)
 	{
@@ -163,6 +158,7 @@ void D3D11DuplicateEngine::Shutdown()
 	m_ownsD3D11Engine = false;
 
 	m_initialized = false;
+	SetCaptureState(CaptureState::Idle);
 }
 
 bool D3D11DuplicateEngine::SetCaptureOutputMode(CaptureOutputMode outputMode)
@@ -201,6 +197,17 @@ bool D3D11DuplicateEngine::IsImmediateContextGateEnabled() const
 	return m_D3D11Engine
 		? m_D3D11Engine->IsImmediateContextGateEnabled()
 		: m_immediateContextGateEnabled;
+}
+
+void D3D11DuplicateEngine::SetSkipUnchangedFrames(bool enabled)
+{
+	::InterlockedExchange(&m_skipUnchangedFrames, enabled ? TRUE : FALSE);
+}
+
+bool D3D11DuplicateEngine::IsSkipUnchangedFramesEnabled() const
+{
+	return ::InterlockedCompareExchange(
+		const_cast<volatile LONG*>(&m_skipUnchangedFrames), 0, 0) != FALSE;
 }
 
 void D3D11DuplicateEngine::SetTargetFps(uint64_t fps)
@@ -277,14 +284,19 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT timeout_ms, CaptureFrameResult& out
 	// 프레임 획득
 	HRESULT hr = m_deskDupl->AcquireNextFrame(timeout_ms, &frameInfo, &desktopResource);
 	if (hr == DXGI_ERROR_WAIT_TIMEOUT)
+	{
+		::InterlockedIncrement64(&m_timeoutCount);
 		return true;
+	}
 
 	if (FAILED(hr))
 	{
-		if (hr == DXGI_ERROR_ACCESS_LOST)
-		{
-			m_initialized = false;
-		}
+		RecordError(hr);
+
+		// ACCESS_LOST 는 잠금화면, UAC 보안 데스크톱, 해상도 변경, 전체화면 전환,
+		// TDR, RDP 연결에서 일상적으로 발생한다. 전부 재연결로 흡수한다.
+		// 그 외 실패도 duplication 을 다시 여는 것 말고 할 수 있는 게 없다.
+		EnterReconnecting(hr);
 		return false;
 	}
 
@@ -317,6 +329,24 @@ bool D3D11DuplicateEngine::AcquireFrame(UINT timeout_ms, CaptureFrameResult& out
 			ReleaseFrame();
 			return false;
 		}
+	}
+
+	// LastPresentTime 이 0 이면 데스크톱 이미지는 직전 프레임과 같다.
+	// 마우스만 움직인 경우가 대부분이라 복사할 이유가 없다.
+	outResult.desktopUpdated = (frameInfo.LastPresentTime.QuadPart != 0);
+
+	const bool skipThisFrame = !outResult.desktopUpdated && IsSkipUnchangedFramesEnabled();
+	if (skipThisFrame)
+	{
+		::InterlockedIncrement64(&m_skippedFrameCount);
+
+		// 텍스처는 돌려준다. 호출자가 발행 여부를 desktopUpdated 로 판단한다.
+		outResult.texture = m_capturedTexture;
+		outResult.frameInfo = frameInfo;
+		if (m_useMouseInfo)
+			outResult.mouseInfo = m_mouseInfo;
+
+		return true;
 	}
 
 	bool sharedFrameReady = false;
@@ -399,22 +429,28 @@ void D3D11DuplicateEngine::ReleaseFrame()
 	SafeRelease(m_capturedTexture);
 }
 
+// 재연결 경로에서 반복 호출된다. 실패하면 반드시 자기가 잡은 것을 전부
+// 놓고 나가야 다음 시도가 깨끗한 상태에서 시작한다.
 HRESULT D3D11DuplicateEngine::InitializeDuplication(uint32_t outputIndex)
 {
-	HRESULT hr = S_OK;
+	if (!m_D3D11Engine)
+		return E_FAIL;
 
 	// Adapter 가져오기
 	IDXGIFactory2* factory = m_D3D11Engine->GetDXGIFactory();
+	if (!factory)
+		return E_FAIL;
+
 	IDXGIAdapter1* adapter = nullptr;
-	if (FAILED(factory->EnumAdapters1(0, &adapter)))
+	if (FAILED(factory->EnumAdapters1(0, &adapter)) || !adapter)
 		return E_FAIL;
 
 	// 해당 인덱스 Output(모니터) 찾기
 	IDXGIOutput* output = nullptr;
-	hr = adapter->EnumOutputs(outputIndex, &output);
+	HRESULT hr = adapter->EnumOutputs(outputIndex, &output);
 	SafeRelease(adapter);
-	if (FAILED(hr))
-		return hr;
+	if (FAILED(hr) || !output)
+		return FAILED(hr) ? hr : E_FAIL;
 
 	output->GetDesc(&m_outputDesc);
 
@@ -428,19 +464,23 @@ HRESULT D3D11DuplicateEngine::InitializeDuplication(uint32_t outputIndex)
 	hr = m_dxgiOutput->DuplicateOutput(m_D3D11Engine->GetD3DDevice(), &m_deskDupl);
 	if (FAILED(hr))
 	{
+		SafeRelease(m_dxgiOutput);
 		return hr;
 	}
 
 	// Output(모니터) 정보 저장
 	m_deskDupl->GetDesc(&m_duplDesc);
 
-	return hr;
+	return S_OK;
 }
 
 void D3D11DuplicateEngine::SetFrameCaptureCallback(FrameCallback funcCallback, void* userData)
 {
-	m_frameCallback = funcCallback;
+	// userData 를 먼저 심고 나서 콜백을 공개한다. 순서가 반대면 캡처 스레드가
+	// 콜백은 보고 userData 는 못 본 상태로 호출할 수 있다.
 	m_userData = userData;
+	::MemoryBarrier();
+	m_frameCallback = funcCallback;
 }
 
 CapturedFrameHandle D3D11DuplicateEngine::GetLatestFrameHandle()
@@ -496,36 +536,117 @@ CapturedFrameHandle D3D11DuplicateEngine::GetLatestFrameHandle()
 	return handle;
 }
 
+// 잘못된 반납은 디버거를 붙일 수 없는 서버에서도 일어난다. 예전에는 __debugbreak 로
+// 프로세스를 세웠지만, 릴리스 빌드에서도 그대로 살아있어 스트리밍이 통째로 죽었다.
+// 이제는 슬롯을 영구히 잠그지 않는 선에서 흡수하고 카운터로만 남긴다.
 void D3D11DuplicateEngine::ReleaseLatestFrameHandle(CapturedFrameHandle& handle)
 {
-	if (!handle.texture)
+	ID3D11Texture2D* texture = handle.texture;
+	const LONG slotId = handle.slotId;
+
+	handle.texture = nullptr;
+	handle.slotId = -1;
+	handle.frameId = 0ULL;
+
+	if (!texture)
 		return;
 
-	const LONG slotId = handle.slotId;
-	if (slotId < 0 || slotId >= POOL_COUNT)
+	texture->Release();
+
+	if (slotId < 0 || slotId >= static_cast<LONG>(POOL_COUNT))
 	{
-		handle.texture->Release();
-		handle.texture = nullptr;
-		handle.slotId = -1;
-		handle.frameId = 0ULL;
-		__debugbreak();
+		// 이 엔진이 준 핸들이 아니거나 slotId 가 훼손됐다. 참조 카운트는
+		// 건드리지 않는다 - 어느 슬롯 것인지 알 수 없기 때문이다.
+		::InterlockedIncrement64(&m_invalidReleaseCount);
 		return;
 	}
 
 	CapturedFrameSlot& frameSlot = m_framePool[slotId];
 
-	handle.texture->Release();
-
-	const LONG referenceCount = ::InterlockedDecrement(&frameSlot.referenceCount);
-	if (referenceCount < 0)
+	if (::InterlockedDecrement(&frameSlot.referenceCount) < 0)
 	{
+		// 이중 반납. 0 으로 되돌리지 않으면 이 슬롯을 다시는 쓸 수 없다.
 		::InterlockedExchange(&frameSlot.referenceCount, 0);
-		__debugbreak();
+		::InterlockedIncrement64(&m_invalidReleaseCount);
 	}
+}
 
-	handle.texture = nullptr;
-	handle.slotId = -1;
-	handle.frameId = 0ULL;
+void D3D11DuplicateEngine::SetCaptureEventCallback(CaptureEventCallback funcCallback, void* userData)
+{
+	m_eventUserData = userData;
+	::MemoryBarrier();
+	m_eventCallback = funcCallback;
+}
+
+CaptureState D3D11DuplicateEngine::GetCaptureState() const
+{
+	return static_cast<CaptureState>(::InterlockedCompareExchange(
+		const_cast<volatile LONG*>(&m_captureState), 0, 0));
+}
+
+void D3D11DuplicateEngine::SetCaptureState(CaptureState state)
+{
+	::InterlockedExchange(&m_captureState, static_cast<LONG>(state));
+}
+
+void D3D11DuplicateEngine::RecordError(HRESULT hr)
+{
+	::InterlockedExchange(&m_lastError, static_cast<LONG>(hr));
+}
+
+void D3D11DuplicateEngine::NotifyEvent(CaptureEventCode code, HRESULT hr)
+{
+	// 콜백 포인터는 다른 스레드에서 갈아끼울 수 있다. 한 번만 읽는다.
+	const CaptureEventCallback callback = m_eventCallback;
+	void* const userData = m_eventUserData;
+
+	if (callback)
+	{
+		callback(code, hr, userData);
+	}
+}
+
+CaptureStats D3D11DuplicateEngine::GetStats() const
+{
+	const auto read64 = [](const volatile LONG64& value) -> uint64_t
+	{
+		return static_cast<uint64_t>(
+			::InterlockedCompareExchange64(const_cast<volatile LONG64*>(&value), 0, 0));
+	};
+
+	CaptureStats stats = {};
+	stats.capturedFrames = read64(m_capturedFrameCount);
+	stats.skippedFrames = read64(m_skippedFrameCount);
+	stats.droppedFrames = read64(m_droppedFrameCount);
+	stats.timeoutCount = read64(m_timeoutCount);
+	stats.accessLostCount = read64(m_accessLostCount);
+	stats.reconnectCount = read64(m_reconnectCount);
+	stats.deviceRecreateCount = read64(m_deviceRecreateCount);
+	stats.invalidReleaseCount = read64(m_invalidReleaseCount);
+	stats.lastError = static_cast<HRESULT>(
+		::InterlockedCompareExchange(const_cast<volatile LONG*>(&m_lastError), 0, 0));
+
+	return stats;
+}
+
+void D3D11DuplicateEngine::DebugSimulateAccessLoss()
+{
+	// 캡처 스레드가 직접 처리하게 둔다. duplication 객체를 다른 스레드에서
+	// 만지면 그 자체가 경쟁 상태가 된다.
+	::InterlockedExchange(&m_debugForceAccessLoss, TRUE);
+}
+
+void D3D11DuplicateEngine::ResetStats()
+{
+	::InterlockedExchange64(&m_capturedFrameCount, 0);
+	::InterlockedExchange64(&m_skippedFrameCount, 0);
+	::InterlockedExchange64(&m_droppedFrameCount, 0);
+	::InterlockedExchange64(&m_timeoutCount, 0);
+	::InterlockedExchange64(&m_accessLostCount, 0);
+	::InterlockedExchange64(&m_reconnectCount, 0);
+	::InterlockedExchange64(&m_deviceRecreateCount, 0);
+	::InterlockedExchange64(&m_invalidReleaseCount, 0);
+	::InterlockedExchange(&m_lastError, S_OK);
 }
 
 uint64_t D3D11DuplicateEngine::GetDroppedFrameCount()
@@ -581,16 +702,49 @@ void D3D11DuplicateEngine::StopThread()
 
 void D3D11DuplicateEngine::ProcessCaptureFrame()
 {
+	switch (GetCaptureState())
+	{
+	case CaptureState::Running:
+		break;
+
+	case CaptureState::Reconnecting:
+		RecoverDuplication();
+		return;
+
+	case CaptureState::Faulted:
+		// 복구 불가. 호출자가 Shutdown/Initialize 로 되살릴 때까지 유휴로 둔다.
+		::Sleep(50);
+		return;
+
+	default:
+		::Sleep(1);
+		return;
+	}
+
+	if (::InterlockedExchange(&m_debugForceAccessLoss, FALSE) != FALSE)
+	{
+		EnterReconnecting(DXGI_ERROR_ACCESS_LOST);
+		return;
+	}
+
 	CaptureFrameResult captureFrame = {};
 
-	if (!AcquireFrame(500, captureFrame))
+	if (!AcquireFrame(kAcquireTimeoutMs, captureFrame))
 	{
-		::Sleep(1);
+		// 실패 처리(재연결 진입 포함)는 AcquireFrame 안에서 끝났다.
 		return;
 	}
 
 	if (!captureFrame.texture)
 		return;
+
+	// 화면이 그대로면 복사도 발행도 콜백도 하지 않는다.
+	// AcquireFrame 이 이미 skippedFrameCount 를 올렸다.
+	if (!captureFrame.desktopUpdated && IsSkipUnchangedFramesEnabled())
+	{
+		ReleaseFrame();
+		return;
+	}
 
 	if (m_captureOutputMode == CaptureOutputMode::SharedTexture && !captureFrame.sharedHandle)
 	{
@@ -603,15 +757,215 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 		CopyCaptureTextureToPool(captureFrame.texture, captureFrame.frameInfo, captureFrame.mouseInfo);
 	}
 
+	::InterlockedIncrement64(&m_capturedFrameCount);
+
 	// Return the duplicated desktop resource before notifying consumers. The
 	// callback may immediately start encoder work on another thread using the
 	// same device, which must not overlap the duplication ownership transition.
 	ReleaseFrame();
 
-	if (m_frameCallback)
+	// 콜백 포인터는 다른 스레드에서 갈아끼울 수 있다. 한 번만 읽는다.
+	const FrameCallback frameCallback = m_frameCallback;
+	void* const frameUserData = m_userData;
+	if (frameCallback)
 	{
-		m_frameCallback(m_userData);
+		frameCallback(frameUserData);
 	}
+}
+
+// 현재 m_duplDesc 기준으로 출력 리소스를 만든다.
+// 재연결 후 해상도가 바뀌었을 때도 같은 경로를 탄다.
+bool D3D11DuplicateEngine::CreateFrameResources()
+{
+	DestroyFrameResources();
+
+	if (!m_D3D11Engine || m_duplDesc.ModeDesc.Width == 0 || m_duplDesc.ModeDesc.Height == 0)
+		return false;
+
+	m_frameWidth = m_duplDesc.ModeDesc.Width;
+	m_frameHeight = m_duplDesc.ModeDesc.Height;
+
+	if (m_captureOutputMode == CaptureOutputMode::SharedTexture)
+	{
+		HRESULT hr = CreateSharedTexture(m_frameWidth, m_frameHeight, &m_sharedTexture, &m_sharedHandle);
+		if (FAILED(hr))
+		{
+			RecordError(hr);
+			return false;
+		}
+
+		hr = m_sharedTexture->QueryInterface(
+			__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&m_sharedKeyedMutex));
+		if (FAILED(hr) || !m_sharedKeyedMutex)
+		{
+			RecordError(hr);
+			return false;
+		}
+
+		return true;
+	}
+
+	if (m_captureOutputMode == CaptureOutputMode::FramePool)
+		return InitializeCaptureFramePool();
+
+	return false;
+}
+
+void D3D11DuplicateEngine::DestroyFrameResources()
+{
+	DestroyCaptureFramePool();
+
+	SafeRelease(m_sharedKeyedMutex);
+	SafeRelease(m_sharedTexture);
+	m_sharedHandle = nullptr;
+
+	m_frameWidth = 0;
+	m_frameHeight = 0;
+}
+
+bool D3D11DuplicateEngine::IsDeviceLost() const
+{
+	if (!m_D3D11Engine)
+		return true;
+
+	ID3D11Device1* device = m_D3D11Engine->GetD3DDevice();
+	if (!device)
+		return true;
+
+	return FAILED(device->GetDeviceRemovedReason());
+}
+
+void D3D11DuplicateEngine::EnterReconnecting(HRESULT hr)
+{
+	RecordError(hr);
+
+	// duplication 을 쥔 채로 들어오면 재연결 시 놓을 수 없다.
+	ReleaseFrame();
+
+	if (GetCaptureState() == CaptureState::Reconnecting)
+		return;
+
+	::InterlockedIncrement64(&m_accessLostCount);
+
+	m_reconnectAttempt = 0;
+	m_reconnectDelayMs = kReconnectMinDelayMs;
+
+	SetCaptureState(CaptureState::Reconnecting);
+	NotifyEvent(CaptureEventCode::AccessLost, hr);
+}
+
+void D3D11DuplicateEngine::EnterFaulted(CaptureEventCode code, HRESULT hr)
+{
+	RecordError(hr);
+	ReleaseFrame();
+
+	SetCaptureState(CaptureState::Faulted);
+	NotifyEvent(code, hr);
+}
+
+void D3D11DuplicateEngine::BackoffReconnectDelay()
+{
+	::Sleep(m_reconnectDelayMs);
+
+	m_reconnectDelayMs = (m_reconnectDelayMs * 2 < kReconnectMaxDelayMs)
+		? m_reconnectDelayMs * 2
+		: kReconnectMaxDelayMs;
+}
+
+// 디바이스가 사라진 경우. 우리가 만든 엔진일 때만 되살릴 수 있다.
+bool D3D11DuplicateEngine::RecreateLostDevice()
+{
+	HRESULT reason = DXGI_ERROR_DEVICE_REMOVED;
+	if (m_D3D11Engine)
+	{
+		ID3D11Device1* device = m_D3D11Engine->GetD3DDevice();
+		if (device)
+			reason = device->GetDeviceRemovedReason();
+	}
+
+	if (!m_deviceRemovedNotified)
+	{
+		m_deviceRemovedNotified = true;
+		NotifyEvent(CaptureEventCode::DeviceRemoved, reason);
+	}
+
+	if (!m_ownsD3D11Engine || !m_D3D11Engine)
+	{
+		// 외부 엔진의 디바이스는 다른 사용자와 공유된다. 여기서 마음대로
+		// 다시 만들면 그쪽 리소스가 전부 깨지므로 호출자에게 넘긴다.
+		EnterFaulted(CaptureEventCode::DeviceRemoved, reason);
+		return false;
+	}
+
+	DestroyFrameResources();
+	SafeRelease(m_deskDupl);
+	SafeRelease(m_dxgiOutput);
+
+	m_D3D11Engine->DiscardDevice();
+	if (!m_D3D11Engine->RecreateDevice())
+		return false;
+
+	::InterlockedIncrement64(&m_deviceRecreateCount);
+	m_deviceRemovedNotified = false;
+
+	// 이전에 나눠준 텍스처와 공유 핸들은 모두 무효다.
+	NotifyEvent(CaptureEventCode::DeviceRecreated, S_OK);
+	return true;
+}
+
+// 캡처 스레드에서 한 번에 한 번씩만 시도한다. 실패하면 백오프 후 반환해
+// 정지 요청에 빠르게 반응할 수 있게 한다.
+void D3D11DuplicateEngine::RecoverDuplication()
+{
+	++m_reconnectAttempt;
+
+	ReleaseFrame();
+	SafeRelease(m_deskDupl);
+	SafeRelease(m_dxgiOutput);
+
+	if (IsDeviceLost())
+	{
+		if (!RecreateLostDevice())
+		{
+			if (GetCaptureState() != CaptureState::Faulted)
+				BackoffReconnectDelay();
+			return;
+		}
+	}
+
+	const HRESULT hr = InitializeDuplication(m_outputIndex);
+	if (FAILED(hr))
+	{
+		RecordError(hr);
+
+		// 잠금화면/보안 데스크톱 동안에는 계속 실패한다. 정상이므로 계속 시도하되
+		// 통지는 가끔만 해서 폭주를 막는다.
+		if ((m_reconnectAttempt % kReconnectNotifyInterval) == 0)
+			NotifyEvent(CaptureEventCode::Reconnecting, hr);
+
+		BackoffReconnectDelay();
+		return;
+	}
+
+	// 잠금화면을 거치는 동안 해상도가 바뀌었을 수 있다.
+	if (m_duplDesc.ModeDesc.Width != m_frameWidth ||
+		m_duplDesc.ModeDesc.Height != m_frameHeight)
+	{
+		if (!CreateFrameResources())
+		{
+			EnterFaulted(CaptureEventCode::Faulted, E_FAIL);
+			return;
+		}
+
+		NotifyEvent(CaptureEventCode::ModeChanged, S_OK);
+	}
+
+	m_reconnectAttempt = 0;
+	m_reconnectDelayMs = kReconnectMinDelayMs;
+	::InterlockedIncrement64(&m_reconnectCount);
+
+	SetCaptureState(CaptureState::Running);
+	NotifyEvent(CaptureEventCode::Reconnected, S_OK);
 }
 
 // 로컬 뷰어(ImageViewer.dll)와 Zero-Copy를 위한 텍스처 생성
