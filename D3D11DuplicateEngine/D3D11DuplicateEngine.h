@@ -144,7 +144,8 @@ private:
 	DXGI_OUTPUT_DESC m_outputDesc = {};
 
 	// Capture Frame per second
-	uint64_t m_captureFPS = 0;
+	// 페이싱 스레드가 매 반복 읽고 임의 스레드가 SetTargetFps 로 쓴다.
+	volatile LONG64 m_captureFPS = 0;
 
 	// Capture Result
 	static constexpr size_t POOL_COUNT = 4;

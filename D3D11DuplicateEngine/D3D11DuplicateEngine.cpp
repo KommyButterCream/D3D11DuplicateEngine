@@ -209,18 +209,17 @@ void D3D11DuplicateEngine::SetSkipUnchangedFrames(bool enabled)
 
 bool D3D11DuplicateEngine::IsSkipUnchangedFramesEnabled() const
 {
-	return ::InterlockedCompareExchange(
-		const_cast<volatile LONG*>(&m_skipUnchangedFrames), 0, 0) != FALSE;
+	return ::ReadAcquire(&m_skipUnchangedFrames) != FALSE;
 }
 
 void D3D11DuplicateEngine::SetTargetFps(uint64_t fps)
 {
-	m_captureFPS = fps;
+	::WriteRelease64(&m_captureFPS, static_cast<LONG64>(fps));
 }
 
 uint64_t D3D11DuplicateEngine::GetTargetFps() const
 {
-	return m_captureFPS;
+	return static_cast<uint64_t>(::ReadAcquire64(&m_captureFPS));
 }
 
 uint32_t D3D11DuplicateEngine::GetOutputCount() const
@@ -502,16 +501,16 @@ CapturedFrameHandle D3D11DuplicateEngine::GetLatestFrameHandle()
 			return handle;
 
 		CapturedFrameSlot& frameSlot = m_framePool[slotId];
-		const LONG status = ::InterlockedCompareExchange(&frameSlot.status, 0, 0);
-		const LONG64 slotFrameId = ::InterlockedCompareExchange64(&frameSlot.frameId, 0, 0);
+		const LONG status = ::ReadAcquire(&frameSlot.status);
+		const LONG64 slotFrameId = ::ReadAcquire64(&frameSlot.frameId);
 
 		if (status != FrameStatus::READY || slotFrameId != latestFrameId || !frameSlot.texture)
 			continue;
 
 		::InterlockedIncrement(&frameSlot.referenceCount);
 
-		const LONG statusAfter = ::InterlockedCompareExchange(&frameSlot.status, 0, 0);
-		const LONG64 slotFrameIdAfter = ::InterlockedCompareExchange64(&frameSlot.frameId, 0, 0);
+		const LONG statusAfter = ::ReadAcquire(&frameSlot.status);
+		const LONG64 slotFrameIdAfter = ::ReadAcquire64(&frameSlot.frameId);
 		const LONG64 latestFrameIdAfter = GetLatestFrameID();
 		const LONG latestSlotIdAfter = GetLatestFrameSlotID();
 
@@ -583,8 +582,7 @@ void D3D11DuplicateEngine::SetCaptureEventCallback(CaptureEventCallback funcCall
 
 CaptureState D3D11DuplicateEngine::GetCaptureState() const
 {
-	return static_cast<CaptureState>(::InterlockedCompareExchange(
-		const_cast<volatile LONG*>(&m_captureState), 0, 0));
+	return static_cast<CaptureState>(::ReadAcquire(&m_captureState));
 }
 
 void D3D11DuplicateEngine::SetCaptureState(CaptureState state)
@@ -613,8 +611,7 @@ CaptureStats D3D11DuplicateEngine::GetStats() const
 {
 	const auto read64 = [](const volatile LONG64& value) -> uint64_t
 	{
-		return static_cast<uint64_t>(
-			::InterlockedCompareExchange64(const_cast<volatile LONG64*>(&value), 0, 0));
+		return static_cast<uint64_t>(::ReadAcquire64(&value));
 	};
 
 	CaptureStats stats = {};
@@ -626,8 +623,7 @@ CaptureStats D3D11DuplicateEngine::GetStats() const
 	stats.reconnectCount = read64(m_reconnectCount);
 	stats.deviceRecreateCount = read64(m_deviceRecreateCount);
 	stats.invalidReleaseCount = read64(m_invalidReleaseCount);
-	stats.lastError = static_cast<HRESULT>(
-		::InterlockedCompareExchange(const_cast<volatile LONG*>(&m_lastError), 0, 0));
+	stats.lastError = static_cast<HRESULT>(::ReadAcquire(&m_lastError));
 
 	return stats;
 }
@@ -654,7 +650,7 @@ void D3D11DuplicateEngine::ResetStats()
 
 uint64_t D3D11DuplicateEngine::GetDroppedFrameCount()
 {
-	return static_cast<uint64_t>(::InterlockedCompareExchange64(&m_droppedFrameCount, 0, 0));
+	return static_cast<uint64_t>(::ReadAcquire64(&m_droppedFrameCount));
 }
 
 ID3D11Device1* D3D11DuplicateEngine::GetD3DDevice()
@@ -1100,18 +1096,18 @@ void D3D11DuplicateEngine::CopyCaptureTextureToPool(ID3D11Texture2D* capturedTex
 		if (!frameSlot.texture)
 			continue;
 
-		const LONG referenceCount = ::InterlockedCompareExchange(&frameSlot.referenceCount, 0, 0);
+		const LONG referenceCount = ::ReadAcquire(&frameSlot.referenceCount);
 		if (referenceCount != 0)
 			continue;
 
-		const LONG previousStatus = ::InterlockedCompareExchange(&frameSlot.status, 0, 0);
+		const LONG previousStatus = ::ReadAcquire(&frameSlot.status);
 		if (previousStatus == FrameStatus::BUSY)
 			continue;
 
 		if (::InterlockedCompareExchange(&frameSlot.status, FrameStatus::BUSY, previousStatus) != previousStatus)
 			continue;
 
-		if (::InterlockedCompareExchange(&frameSlot.referenceCount, 0, 0) != 0)
+		if (::ReadAcquire(&frameSlot.referenceCount) != 0)
 		{
 			::InterlockedExchange(&frameSlot.status, previousStatus);
 			continue;
@@ -1154,12 +1150,12 @@ void D3D11DuplicateEngine::CopyCaptureTextureToPool(ID3D11Texture2D* capturedTex
 
 LONG64 D3D11DuplicateEngine::GetLatestFrameID()
 {
-	return ::InterlockedCompareExchange64(&m_latestFrameId, 0, 0);
+	return ::ReadAcquire64(&m_latestFrameId);
 }
 
 LONG D3D11DuplicateEngine::GetLatestFrameSlotID()
 {
-	return ::InterlockedCompareExchange(&m_latestFrameSlotId, 0, 0);
+	return ::ReadAcquire(&m_latestFrameSlotId);
 }
 
 bool D3D11DuplicateEngine::WaitForFrameSlotCopy(CapturedFrameSlot& frameSlot)
