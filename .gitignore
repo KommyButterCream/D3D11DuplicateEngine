@@ -10,3 +10,6 @@ obj/
 *.VC.db
 *.VC.opendb
 *.bak
+
+# 셰이더 빌드 산출물 (FxCompile 이 $(SolutionDir)Shaders 로 출력)
+/Shaders/
