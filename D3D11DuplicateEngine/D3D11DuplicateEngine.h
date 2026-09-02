@@ -172,7 +172,7 @@ private:
 
 	// 복구. 전부 캡처 스레드 전용이라 원자성이 필요 없다.
 	uint32_t m_reconnectAttempt = 0;
-	uint32_t m_reconnectDelayMs = 0;
+	uint32_t m_reconnectDelay_ms = 0;
 	bool m_deviceRemovedNotified = false;
 	volatile LONG m_debugForceAccessLoss = FALSE;
 

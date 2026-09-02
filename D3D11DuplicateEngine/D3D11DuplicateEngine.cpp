@@ -12,18 +12,18 @@ namespace
 	constexpr UINT64 kCaptureAcquireKey = 0;
 	constexpr UINT64 kViewerAcquireKey = 1;
 
-	constexpr UINT kAcquireTimeoutMs = 500;
+	constexpr UINT kAcquireTimeout_ms = 500;
 
 	// 재연결 백오프. 보안 데스크톱 전환은 보통 1~2 초 안에 끝나므로
 	// 짧게 시작해 500ms 까지만 늘린다.
-	constexpr uint32_t kReconnectMinDelayMs = 50;
-	constexpr uint32_t kReconnectMaxDelayMs = 500;
+	constexpr uint32_t kReconnectMinDelay_ms = 50;
+	constexpr uint32_t kReconnectMaxDelay_ms = 500;
 
 	// 재연결이 길어질 때 통지 폭주를 막는 간격(시도 횟수 기준).
 	constexpr uint32_t kReconnectNotifyInterval = 20;
 
 	// Faulted 상태에서 유휴로 도는 간격.
-	constexpr uint32_t kFaultedIdleDelayMs = 50;
+	constexpr uint32_t kFaultedIdleDelay_ms = 50;
 }
 
 D3D11DuplicateEngine::~D3D11DuplicateEngine()
@@ -40,6 +40,9 @@ bool D3D11DuplicateEngine::Initialize(D3D11RenderEngine* D3D11Engine, uint32_t o
 
 	if (D3D11Engine)
 	{
+		// D3D11Engine 을 외부에서 받아 공유해서 사용하는 경우
+		// D3D11DeviceContext 를 공유해서 사용해야하므로
+		// D3D11DeviceContext 의 CopyResource 같은 메서드 사용을 위해 Lock 사용.
 		m_D3D11Engine = D3D11Engine;
 		m_ownsD3D11Engine = false;
 
@@ -128,7 +131,7 @@ void D3D11DuplicateEngine::Shutdown()
 	m_frameAcquired = false;
 
 	m_reconnectAttempt = 0;
-	m_reconnectDelayMs = kReconnectMinDelayMs;
+	m_reconnectDelay_ms = kReconnectMinDelay_ms;
 	m_deviceRemovedNotified = false;
 	m_duplDesc = {};
 	m_outputDesc = {};
@@ -712,7 +715,7 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 
 	case CaptureState::Faulted:
 		// 복구 불가. 호출자가 Shutdown/Initialize 로 되살릴 때까지 유휴로 둔다.
-		SleepUnlessStopping(kFaultedIdleDelayMs);
+		SleepUnlessStopping(kFaultedIdleDelay_ms);
 		return;
 
 	default:
@@ -728,7 +731,7 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 
 	CaptureFrameResult captureFrame = {};
 
-	if (!AcquireFrame(kAcquireTimeoutMs, captureFrame))
+	if (!AcquireFrame(kAcquireTimeout_ms, captureFrame))
 	{
 		// 실패 처리(재연결 진입 포함)는 AcquireFrame 안에서 끝났다.
 		return;
@@ -793,8 +796,7 @@ bool D3D11DuplicateEngine::CreateFrameResources()
 			return false;
 		}
 
-		hr = m_sharedTexture->QueryInterface(
-			__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&m_sharedKeyedMutex));
+		hr = m_sharedTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&m_sharedKeyedMutex));
 		if (FAILED(hr) || !m_sharedKeyedMutex)
 		{
 			RecordError(hr);
@@ -847,7 +849,7 @@ void D3D11DuplicateEngine::EnterReconnecting(HRESULT hr)
 	::InterlockedIncrement64(&m_accessLostCount);
 
 	m_reconnectAttempt = 0;
-	m_reconnectDelayMs = kReconnectMinDelayMs;
+	m_reconnectDelay_ms = kReconnectMinDelay_ms;
 
 	SetCaptureState(CaptureState::Reconnecting);
 	NotifyEvent(CaptureEventCode::AccessLost, hr);
@@ -885,11 +887,11 @@ bool D3D11DuplicateEngine::SleepUnlessStopping(uint32_t milliseconds)
 
 void D3D11DuplicateEngine::BackoffReconnectDelay()
 {
-	SleepUnlessStopping(m_reconnectDelayMs);
+	SleepUnlessStopping(m_reconnectDelay_ms);
 
-	m_reconnectDelayMs = (m_reconnectDelayMs * 2 < kReconnectMaxDelayMs)
-		? m_reconnectDelayMs * 2
-		: kReconnectMaxDelayMs;
+	m_reconnectDelay_ms = (m_reconnectDelay_ms * 2 < kReconnectMaxDelay_ms)
+		? m_reconnectDelay_ms * 2
+		: kReconnectMaxDelay_ms;
 }
 
 // 디바이스가 사라진 경우. 우리가 만든 엔진일 때만 되살릴 수 있다.
@@ -981,7 +983,7 @@ void D3D11DuplicateEngine::RecoverDuplication()
 	}
 
 	m_reconnectAttempt = 0;
-	m_reconnectDelayMs = kReconnectMinDelayMs;
+	m_reconnectDelay_ms = kReconnectMinDelay_ms;
 	::InterlockedIncrement64(&m_reconnectCount);
 
 	SetCaptureState(CaptureState::Running);

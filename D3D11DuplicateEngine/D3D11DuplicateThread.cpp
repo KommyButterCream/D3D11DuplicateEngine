@@ -43,45 +43,63 @@ void D3D11DuplicateThread::Run()
 		return;
 
 	HANDLE timer = CreateFrameTimer();
-	uint64_t armedFps = 0;
+	uint64_t previousFps = 0;
 
 	while (!IsStopRequested())
 	{
 		const uint64_t fps = m_duplicateEngine->GetTargetFps();
 
-		// fps = 0 은 제한 없음. AcquireNextFrame 자체가 블로킹이라 바쁜 대기가 아니다.
 		if (fps == 0 || !timer)
 		{
-			if (armedFps != 0 && timer)
+			// fps 가 0 일때에는 대기 없는 무제한 캡쳐모드이다.
+			// 그러므로 기존에 등록된 타이머가 있으면 취소시키고
+			// 화면 프레임을 캡쳐한 후 바로 다음 프레임을 캡쳐하러 continue 한다.
+			if (previousFps != 0 && timer)
 			{
+				// 캡쳐 Target FPS 가 x 에서 0으로 변경된 경우
+				// 기존 타이머를 취소한다.
 				::CancelWaitableTimer(timer);
-				armedFps = 0;
+				previousFps = 0;
 			}
 
+			// 화면 프레임 캡쳐 진행
 			m_duplicateEngine->ProcessCaptureFrame();
+
 			continue;
 		}
 
-		if (fps != armedFps)
+		// 무제한 캡쳐모드가 아닌 경우
+		// 일반적으로 캡쳐 FPS 가 설정되어 있는 경우이다.
+		if (fps != previousFps)
 		{
-			LONG period = static_cast<LONG>(1000ULL / fps);
-			if (period <= 0)
-				period = 1;
+			// 타이머 설정은 fps 가 변경된 경우에만 수행한다.
 
-			// 음수 = 상대 시각(100ns 단위). 첫 발화는 즉시.
-			LARGE_INTEGER dueTime = {};
-			dueTime.QuadPart = -1LL;
+			// period_ms : 반복 주기 (ms)
+			// fps 로부터 1-frame capture time ms 계산
+			LONG period_ms = static_cast<LONG>(1000ULL / fps);
 
-			if (!::SetWaitableTimer(timer, &dueTime, period, nullptr, nullptr, FALSE))
+			// 최소 주기(ms) 를 1ms 로 강제. 0 이 되지 않도록 한다.
+			if (period_ms <= 0)
+				period_ms = 1;
+
+			// 음수 = 상대 시각(100ns 단위)
+			// 현재 시간으로부터 100ns 이후니 즉시 첫 신호가 발생된다.
+			LARGE_INTEGER dueTime_100ns = {};
+			dueTime_100ns.QuadPart = -1LL; // 100ns
+
+			// fps = 60 이면 period = 1000 / 60 = 16ms 이므로
+			// 최초 신호 이후 16ms 마다 타이머가 다시 신호된다.
+			// Sleep(16ms) 보다 훨씬 정밀하다.
+			if (!::SetWaitableTimer(timer, &dueTime_100ns, period_ms, nullptr, nullptr, FALSE))
 			{
 				// 타이머를 못 걸면 무제한 모드로 떨어진다. 멈추는 것보다 낫다.
 				::CloseHandle(timer);
 				timer = nullptr;
-				armedFps = 0;
+				previousFps = 0;
 				continue;
 			}
 
-			armedFps = fps;
+			previousFps = fps;
 		}
 
 		// timer 는 루프 안에서 교체될 수 있으므로 매번 새로 구성한다.
@@ -98,10 +116,13 @@ void D3D11DuplicateThread::Run()
 			// 대기 실패. 타이머를 포기하고 무제한 모드로 계속한다.
 			::CloseHandle(timer);
 			timer = nullptr;
-			armedFps = 0;
+			previousFps = 0;
 			continue;
 		}
 
+		// waitResult 가 WAIT_OBJECT_0 + 1 인 경우
+		// 화면 프레임 캡쳐 진행
+		// 여기는 사용자가 설정한 주기 마다 화면 캡쳐를 수행해주는 곳.
 		m_duplicateEngine->ProcessCaptureFrame();
 	}
 
