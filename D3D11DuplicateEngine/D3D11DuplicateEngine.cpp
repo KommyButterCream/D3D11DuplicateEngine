@@ -21,6 +21,9 @@ namespace
 
 	// 재연결이 길어질 때 통지 폭주를 막는 간격(시도 횟수 기준).
 	constexpr uint32_t kReconnectNotifyInterval = 20;
+
+	// Faulted 상태에서 유휴로 도는 간격.
+	constexpr uint32_t kFaultedIdleDelayMs = 50;
 }
 
 D3D11DuplicateEngine::~D3D11DuplicateEngine()
@@ -713,11 +716,11 @@ void D3D11DuplicateEngine::ProcessCaptureFrame()
 
 	case CaptureState::Faulted:
 		// 복구 불가. 호출자가 Shutdown/Initialize 로 되살릴 때까지 유휴로 둔다.
-		::Sleep(50);
+		SleepUnlessStopping(kFaultedIdleDelayMs);
 		return;
 
 	default:
-		::Sleep(1);
+		SleepUnlessStopping(1);
 		return;
 	}
 
@@ -863,9 +866,30 @@ void D3D11DuplicateEngine::EnterFaulted(CaptureEventCode code, HRESULT hr)
 	NotifyEvent(code, hr);
 }
 
+// 정지 요청이 오면 즉시 깨어나는 대기. 캡처 스레드 전용이다.
+//
+// 그냥 Sleep 을 쓰면 재연결 백오프(최대 500ms)나 Faulted 유휴(50ms) 도중에는
+// StopThread 가 그만큼 붙잡힌다. 정지 이벤트는 수동 리셋이라 한 번 신호되면
+// 계속 신호 상태로 남고, 이후 대기는 모두 즉시 통과한다.
+//
+// 반환값은 "대기를 끝까지 채웠는가" 다. false 면 정지 요청이 온 것이므로
+// 호출자는 하던 일을 접고 나가야 한다.
+bool D3D11DuplicateEngine::SleepUnlessStopping(uint32_t milliseconds)
+{
+	HANDLE stopEvent = m_duplicateThread ? m_duplicateThread->GetStopEvent() : nullptr;
+	if (!stopEvent)
+	{
+		// 스레드 없이 ProcessCaptureFrame 을 직접 돌리는 구성.
+		::Sleep(milliseconds);
+		return true;
+	}
+
+	return ::WaitForSingleObject(stopEvent, milliseconds) == WAIT_TIMEOUT;
+}
+
 void D3D11DuplicateEngine::BackoffReconnectDelay()
 {
-	::Sleep(m_reconnectDelayMs);
+	SleepUnlessStopping(m_reconnectDelayMs);
 
 	m_reconnectDelayMs = (m_reconnectDelayMs * 2 < kReconnectMaxDelayMs)
 		? m_reconnectDelayMs * 2

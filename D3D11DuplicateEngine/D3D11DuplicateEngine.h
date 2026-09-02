@@ -107,6 +107,10 @@ private:
 	bool CreateFrameResources();
 	void DestroyFrameResources();
 
+	// 정지 요청이 오면 즉시 깨어나는 대기. 캡처 스레드 전용.
+	// false 를 돌려주면 정지 요청이 온 것이다.
+	bool SleepUnlessStopping(uint32_t milliseconds);
+
 	// 복구
 	bool IsDeviceLost() const;
 	void EnterReconnecting(HRESULT hr);
