@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <d3d11_1.h>
+#include <dxgi1_2.h>
 #include <stdint.h>
 
 // 마우스 정보 (MS 예제 참고)
@@ -21,7 +22,6 @@ struct PTR_INFO
 struct CaptureFrameResult
 {
 	ID3D11Texture2D* texture = nullptr;      // 캡처된 텍스처
-	HANDLE sharedHandle = nullptr; // 로컬 뷰어용 공유 핸들
 	DXGI_OUTDUPL_FRAME_INFO frameInfo = {};   // 프레임 메타데이터 (Dirty Rects 등)
 	BYTE* metaData = nullptr;
 	UINT dirtyCount = 0;
@@ -31,12 +31,6 @@ struct CaptureFrameResult
 	// 데스크톱 이미지가 실제로 갱신되었는가(frameInfo.LastPresentTime != 0).
 	// false 면 마우스만 움직인 것이고 화면 내용은 직전 프레임과 같다.
 	bool desktopUpdated = false;
-};
-
-enum class CaptureOutputMode : uint32_t
-{
-	FramePool = 0,
-	SharedTexture,
 };
 
 // 캡처 파이프라인의 진행 상태.
@@ -86,9 +80,35 @@ enum FrameStatus : LONG
 	BUSY,
 };
 
+
+// 공유 프레임 풀의 keyed mutex 규약.
+//
+// 키를 하나만 쓴다. 생산자 키 / 소비자 키를 번갈아 쓰는 방식은 두 쪽이
+// 반드시 짝을 맞춰 주고받을 때만 성립하는데, 이 풀은 latest-only 로
+// 소비되어 "소비자가 손도 대지 않은 채 버려지는 프레임" 이 정상 경로다.
+// 그때 키가 소비자 쪽에 걸린 채 남아 그 슬롯이 영구히 죽는다.
+//
+// 키 하나면 어느 쪽이든 아무 때나 잡을 수 있고, 논리적 소유권은 슬롯의
+// status / referenceCount 가 이미 처리한다. keyed mutex 는 디바이스 간
+// GPU 동기화만 맡으면 되고 그게 원래 필요한 전부다.
+constexpr UINT64 FRAME_POOL_MUTEX_KEY = 0;
+
+// 잡지 못하면 그 프레임을 버린다. INFINITE 는 쓰지 않는다 —
+// 이 구조를 도입한 이유 자체가 무기한 대기를 없애는 것이었다.
+constexpr DWORD FRAME_POOL_MUTEX_TIMEOUT_MS = 100;
 struct CapturedFrameSlot
 {
 	ID3D11Texture2D* texture = nullptr;
+	
+	// 프레임 풀을 다른 D3D11 디바이스와 공유할 때만 채워진다.
+	// (SetFramePoolSharable)
+	//
+	// sharedHandle 은 소비자가 OpenSharedResource1 로 열어 갈 핸들이고,
+	// keyedMutex 는 이 텍스처를 건드리는 모든 디바이스가 공유하는 동기화
+	// 객체다. 우리 쪽 CopyResource 도 반드시 이걸 잡고 해야 한다 —
+	// 한쪽만 지키면 지키지 않는 것과 같다.
+	HANDLE sharedHandle = nullptr;
+	IDXGIKeyedMutex* keyedMutex = nullptr;
 	ID3D11Query* copyDoneQuery = nullptr;
 	DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
 	PTR_INFO mouseInfo = {};
